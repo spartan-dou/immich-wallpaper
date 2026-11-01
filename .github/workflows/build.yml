@@ -1,0 +1,57 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # nécessaire pour publier la release sur un tag
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Dépendances
+        run: go mod tidy
+
+      - name: Vérifications
+        run: |
+          go vet ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=windows GOARCH=arm64 go vet ./...
+          go test ./...
+
+      - name: Build Windows x64 + ARM64
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="dev-${GITHUB_SHA::7}"; fi
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            name=$([ "$arch" = amd64 ] && echo x64 || echo arm64)
+            GOOS=windows GOARCH=$arch CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-H windowsgui -s -w -X main.appVersion=$VERSION" \
+              -o "dist/ImmichWallpaper-$name.exe" .
+          done
+          (cd dist && sha256sum *.exe > SHA256SUMS.txt)
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ImmichWallpaper
+          path: dist/*
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Immich Wallpaper $GITHUB_REF_NAME" --generate-notes

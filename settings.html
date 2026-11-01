@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Immich Wallpaper — Paramètres</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #fff; --fg: #1d2129; --muted: #69707d; --line: #dde1e6;
+    --accent: #4250af; --accent-fg: #fff; --ok: #1f7a3a; --err: #b42318; --field: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15171c; --card: #1e2128; --fg: #e8eaee; --muted: #9aa1ad; --line: #30343d;
+            --accent: #7d8ce8; --accent-fg: #0f1220; --ok: #5fcf83; --err: #ff8a7a; --field: #262a32; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.45 "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; }
+  main { max-width: 760px; margin: 32px auto; padding: 0 20px 40px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+            padding: 20px; margin-bottom: 16px; }
+  h2 { font-size: 15px; font-weight: 600; margin: 0 0 14px; }
+  label { display: block; font-weight: 500; margin: 12px 0 4px; }
+  label:first-of-type { margin-top: 0; }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  input[type=text], input[type=password], input[type=number], select {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--field); color: var(--fg); font: inherit; }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
+  .check { display: flex; align-items: center; gap: 8px; font-weight: 400; margin: 10px 0 0; }
+  button { font: inherit; padding: 8px 16px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--field); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .55; cursor: default; }
+  .bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  #albums { max-height: 340px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; margin-top: 10px; }
+  .album { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--line);
+           font-weight: 400; margin: 0; cursor: pointer; }
+  .album:last-child { border-bottom: 0; }
+  .album .n { margin-left: auto; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .empty { padding: 14px; color: var(--muted); }
+  .msg { font-size: 14px; }
+  .msg.ok { color: var(--ok); } .msg.err { color: var(--err); }
+  #status { color: var(--muted); font-size: 14px; }
+  footer { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; }
+  @media (max-width: 600px) { .row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Immich Wallpaper</h1>
+  <p class="sub" id="status">Chargement…</p>
+
+  <section>
+    <h2>Serveur Immich</h2>
+    <label for="server_url">URL du serveur</label>
+    <input type="text" id="server_url" placeholder="https://immich.exemple.fr" autocomplete="off">
+    <label for="api_key">Token (clé API)</label>
+    <input type="password" id="api_key" autocomplete="off">
+    <div class="hint" id="key_hint">Immich → Paramètres du compte → Clés API. Permissions : album.read, asset.read, asset.view, asset.download.</div>
+    <label class="check"><input type="checkbox" id="insecure_skip_verify"> Accepter un certificat auto-signé</label>
+    <div class="bar" style="margin-top:14px">
+      <button id="test">Tester et charger les albums</button>
+      <span class="msg" id="test_msg"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Albums</h2>
+    <input type="text" id="filter" placeholder="Filtrer…">
+    <div id="albums"><div class="empty">Teste la connexion pour afficher tes albums.</div></div>
+    <div class="hint" id="sel_count"></div>
+  </section>
+
+  <section>
+    <h2>Affichage</h2>
+    <div class="row">
+      <div>
+        <label for="interval_minutes">Changer toutes les (min)</label>
+        <input type="number" id="interval_minutes" min="1">
+      </div>
+      <div>
+        <label for="style">Ajustement</label>
+        <select id="style">
+          <option value="fill">Remplir</option>
+          <option value="fit">Ajuster</option>
+          <option value="stretch">Étirer</option>
+          <option value="center">Centrer</option>
+          <option value="tile">Mosaïque</option>
+          <option value="span">Étendre (multi-écrans)</option>
+        </select>
+      </div>
+      <div>
+        <label for="image_size">Qualité</label>
+        <select id="image_size">
+          <option value="fullsize">Pleine résolution (JPEG)</option>
+          <option value="preview">Aperçu (1440 px, léger)</option>
+          <option value="original">Fichier original</option>
+        </select>
+      </div>
+    </div>
+    <label class="check" style="margin-top:16px"><input type="checkbox" id="landscape_only"> Uniquement les photos en paysage</label>
+    <label class="check"><input type="checkbox" id="change_on_start"> Changer d'image au démarrage</label>
+  </section>
+
+  <section>
+    <h2>Légende et écran de verrouillage</h2>
+    <label class="check" style="margin-top:0"><input type="checkbox" id="show_place"> Afficher le lieu sur l'image <span class="hint" style="margin:0">(ville, région, pays — photos géolocalisées)</span></label>
+    <label class="check"><input type="checkbox" id="show_date"> Afficher le mois et l'année</label>
+    <div class="row" style="grid-template-columns: 1fr 2fr; margin-top:6px">
+      <div>
+        <label for="caption_position">Position du texte</label>
+        <select id="caption_position">
+          <option value="bottom-right">En bas à droite</option>
+          <option value="bottom-left">En bas à gauche</option>
+          <option value="top-right">En haut à droite</option>
+          <option value="top-left">En haut à gauche</option>
+        </select>
+      </div>
+    </div>
+    <label class="check" style="margin-top:16px"><input type="checkbox" id="desktop_link"> Icône « Voir cette photo dans Immich » sur le bureau</label>
+    <div class="hint">Le fond d'écran lui-même n'est pas cliquable sous Windows : cette icône (ou un clic gauche sur l'icône près de l'horloge) ouvre la photo affichée.</div>
+    <label class="check" style="margin-top:16px"><input type="checkbox" id="lock_screen"> Appliquer aussi à l'écran de verrouillage</label>
+    <div class="hint">Dans Windows : Paramètres → Personnalisation → Écran de verrouillage → « Image » (et non « Windows à la une »).</div>
+  </section>
+
+  <footer class="bar">
+    <button class="primary" id="save">Enregistrer</button>
+    <button id="next">Image suivante</button>
+    <span class="msg" id="save_msg"></span>
+  </footer>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let selected = new Set(), albums = [];
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} :
+    { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+function msg(el, text, ok) { el.textContent = text; el.className = 'msg ' + (ok ? 'ok' : 'err'); }
+
+function form() {
+  return {
+    server_url: $('server_url').value, api_key: $('api_key').value,
+    insecure_skip_verify: $('insecure_skip_verify').checked,
+    albums: [...selected],
+    interval_minutes: parseInt($('interval_minutes').value, 10) || 60,
+    style: $('style').value, image_size: $('image_size').value,
+    landscape_only: $('landscape_only').checked, change_on_start: $('change_on_start').checked,
+    show_place: $('show_place').checked, show_date: $('show_date').checked,
+    caption_position: $('caption_position').value, lock_screen: $('lock_screen').checked,
+    desktop_link: $('desktop_link').checked,
+  };
+}
+
+function render() {
+  const box = $('albums'), f = $('filter').value.toLowerCase();
+  const known = new Set(albums.map(a => a.id));
+  const list = albums.concat([...selected].filter(id => !known.has(id))
+                .map(id => ({ id, albumName: '(album ' + id.slice(0, 8) + '…)', assetCount: null })));
+  const shown = list.filter(a => a.albumName.toLowerCase().includes(f));
+  box.innerHTML = '';
+  if (!shown.length) { box.innerHTML = '<div class="empty">' + (list.length ? 'Aucun album ne correspond.' : 'Teste la connexion pour afficher tes albums.') + '</div>'; }
+  for (const a of shown) {
+    const l = document.createElement('label'); l.className = 'album';
+    const c = document.createElement('input'); c.type = 'checkbox'; c.checked = selected.has(a.id);
+    c.onchange = () => { c.checked ? selected.add(a.id) : selected.delete(a.id); count(); };
+    const n = document.createElement('span'); n.textContent = a.albumName;
+    const k = document.createElement('span'); k.className = 'n';
+    k.textContent = a.assetCount == null ? '' : a.assetCount + ' éléments';
+    l.append(c, n, k); box.append(l);
+  }
+  count();
+}
+function count() {
+  $('sel_count').textContent = selected.size ? selected.size + ' album(s) sélectionné(s)' : 'Aucun album sélectionné.';
+}
+
+async function load() {
+  const c = await api('api/config');
+  $('server_url').value = c.server_url || '';
+  $('api_key').placeholder = c.has_key ? '•••••••• (enregistré — laisser vide pour le garder)' : 'Colle ta clé API ici';
+  $('insecure_skip_verify').checked = !!c.insecure_skip_verify;
+  $('interval_minutes').value = c.interval_minutes || 60;
+  $('style').value = c.style || 'fill';
+  $('image_size').value = c.image_size || 'fullsize';
+  $('landscape_only').checked = !!c.landscape_only;
+  $('change_on_start').checked = !!c.change_on_start;
+  $('show_place').checked = !!c.show_place;
+  $('show_date').checked = !!c.show_date;
+  $('caption_position').value = c.caption_position || 'bottom-right';
+  $('lock_screen').checked = !!c.lock_screen;
+  $('desktop_link').checked = c.desktop_link !== false;
+  selected = new Set(c.albums || []);
+  render();
+  if (c.has_key && c.server_url) testConn(true);
+}
+
+async function testConn(quiet) {
+  const b = $('test'); b.disabled = true;
+  if (!quiet) msg($('test_msg'), 'Connexion…', true);
+  try {
+    albums = await api('api/albums', form());
+    albums.sort((x, y) => x.albumName.localeCompare(y.albumName, 'fr'));
+    msg($('test_msg'), 'Connecté — ' + albums.length + ' albums', true);
+    render();
+  } catch (e) { msg($('test_msg'), e.message, false); }
+  b.disabled = false;
+}
+
+async function refreshStatus() {
+  try { $('status').textContent = (await api('api/status')).status || ''; } catch (e) {}
+}
+
+$('test').onclick = () => testConn(false);
+$('filter').oninput = render;
+$('save').onclick = async () => {
+  const b = $('save'); b.disabled = true;
+  try { await api('api/save', form()); msg($('save_msg'), 'Enregistré ✓', true); $('api_key').value = '';
+        $('api_key').placeholder = '•••••••• (enregistré — laisser vide pour le garder)'; }
+  catch (e) { msg($('save_msg'), e.message, false); }
+  b.disabled = false;
+};
+$('next').onclick = async () => {
+  const b = $('next'); b.disabled = true; msg($('save_msg'), 'Changement en cours…', true);
+  try { const r = await api('api/next', {}); msg($('save_msg'), r.ok || 'OK', true); }
+  catch (e) { msg($('save_msg'), e.message, false); }
+  b.disabled = false; refreshStatus();
+};
+
+load().catch(e => msg($('test_msg'), e.message, false));
+refreshStatus(); setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>
