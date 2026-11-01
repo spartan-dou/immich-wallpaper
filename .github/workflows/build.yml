@@ -52,6 +52,11 @@ jobs:
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
+        # La release peut déjà exister si le tag a été créé depuis l'interface « Draft a new release ».
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "Immich Wallpaper $GITHUB_REF_NAME" --generate-notes
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "Immich Wallpaper $GITHUB_REF_NAME" --generate-notes
+          fi
