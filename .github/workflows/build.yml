@@ -1,5 +1,8 @@
 name: build
 
+# Publication d'une release :
+#  - automatiquement quand la version de version.go n'a pas encore de release (push sur main) ;
+#  - ou en poussant un tag vX.Y.Z.
 on:
   push:
     branches: [main]
@@ -8,11 +11,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # nécessaire pour publier la release sur un tag
+  contents: write # nécessaire pour créer le tag et la release
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,9 +35,27 @@ jobs:
           GOOS=windows GOARCH=arm64 go vet ./...
           go test ./...
 
-      - name: Build Windows x64 + ARM64
+      - name: Version
+        id: version
         run: |
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="dev-${GITHUB_SHA::7}"; fi
+          RELEASE=false
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"; RELEASE=true
+          elif [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_NAME" = "main" ]; then
+            V=$(sed -n 's/^var appVersion = "\(.*\)"$/\1/p' version.go)
+            if [ -n "$V" ] && ! gh release view "v$V" >/dev/null 2>&1; then
+              VERSION="$V"; RELEASE=true
+            fi
+          fi
+          [ -n "$VERSION" ] || VERSION="dev-${GITHUB_SHA::7}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
+          echo "Version : $VERSION (release : $RELEASE)"
+
+      - name: Build Windows x64 + ARM64
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
           mkdir -p dist
           for arch in amd64 arm64; do
             name=$([ "$arch" = amd64 ] && echo x64 || echo arm64)
@@ -45,18 +68,17 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ImmichWallpaper
+          name: ImmichWallpaper-${{ steps.version.outputs.version }}
           path: dist/*
 
       - name: Release
-        if: github.ref_type == 'tag'
+        if: steps.version.outputs.release == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
-        # La release peut déjà exister si le tag a été créé depuis l'interface « Draft a new release ».
+          TAG: v${{ steps.version.outputs.version }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --title "Immich Wallpaper $GITHUB_REF_NAME" --generate-notes
+            gh release create "$TAG" dist/* --target "$GITHUB_SHA" \
+              --title "Immich Wallpaper $TAG" --generate-notes
           fi

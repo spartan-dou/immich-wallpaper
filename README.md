@@ -91,7 +91,6 @@ Les fichiers `rsrc_windows_*.syso` contiennent l'icône et le manifeste (DPI, co
 
 ### Publier une version
 
-```sh
-git tag v1.4.0 && git push origin v1.4.0
-```
-La pipeline compile les deux exe et crée la release GitHub correspondante ; les applis installées se mettent à jour d'elles-mêmes dans les 24 h. Chaque push sur `main` produit aussi les exe en artefacts de build.
+Change le numéro dans `version.go` (ex. `var appVersion = "1.5.0"`) et pousse sur `main` : la pipeline voit qu'aucune release `v1.5.0` n'existe, compile les deux exe, crée le tag et la release. Les applis installées se mettent à jour d'elles-mêmes dans les 24 h.
+
+(Pousser un tag `vX.Y.Z` fonctionne aussi.) Les autres push sur `main` produisent seulement des exe de dev en artefacts.
