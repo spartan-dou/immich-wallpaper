@@ -101,10 +101,27 @@ func setAutostart(on bool) error {
 }
 
 // singleInstance renvoie false si l'appli tourne déjà.
+var instanceMutex windows.Handle
+
 func singleInstance() bool {
 	name, _ := windows.UTF16PtrFromString(`Local\ImmichWallpaperSingleton`)
-	_, err := windows.CreateMutex(nil, false, name)
-	return err != windows.ERROR_ALREADY_EXISTS
+	h, err := windows.CreateMutex(nil, false, name)
+	if err == windows.ERROR_ALREADY_EXISTS {
+		if h != 0 {
+			windows.CloseHandle(h)
+		}
+		return false
+	}
+	instanceMutex = h
+	return true
+}
+
+// releaseInstance libère le verrou d'instance unique (avant de lancer la nouvelle version).
+func releaseInstance() {
+	if instanceMutex != 0 {
+		windows.CloseHandle(instanceMutex)
+		instanceMutex = 0
+	}
 }
 
 var procGetSystemMetrics = user32.NewProc("GetSystemMetrics")

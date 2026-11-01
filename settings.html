@@ -127,6 +127,12 @@
     <div class="hint">Dans Windows : Paramètres → Personnalisation → Écran de verrouillage → « Image » (et non « Windows à la une »).</div>
   </section>
 
+  <section>
+    <h2>Mises à jour</h2>
+    <label class="check" style="margin-top:0"><input type="checkbox" id="auto_update"> Installer automatiquement les nouvelles versions publiées sur GitHub</label>
+    <div class="hint">Vérification au démarrage puis une fois par jour. Fichier vérifié par empreinte SHA256 avant installation.</div>
+  </section>
+
   <footer class="bar">
     <button class="primary" id="save">Enregistrer</button>
     <button id="next">Image suivante</button>
@@ -156,7 +162,7 @@ function form() {
     landscape_only: $('landscape_only').checked, change_on_start: $('change_on_start').checked,
     show_place: $('show_place').checked, show_date: $('show_date').checked,
     caption_position: $('caption_position').value, lock_screen: $('lock_screen').checked,
-    desktop_link: $('desktop_link').checked,
+    desktop_link: $('desktop_link').checked, auto_update: $('auto_update').checked,
   };
 }
 
@@ -198,6 +204,7 @@ async function load() {
   $('caption_position').value = c.caption_position || 'bottom-right';
   $('lock_screen').checked = !!c.lock_screen;
   $('desktop_link').checked = c.desktop_link !== false;
+  $('auto_update').checked = c.auto_update !== false;
   selected = new Set(c.albums || []);
   render();
   if (c.has_key && c.server_url) testConn(true);

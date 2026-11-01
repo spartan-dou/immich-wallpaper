@@ -26,6 +26,7 @@ type Config struct {
 	ShowDate           bool     `json:"show_date"`
 	CaptionPosition    string   `json:"caption_position"` // bottom-right | bottom-left | top-right | top-left
 	DesktopLink        bool     `json:"desktop_link"`     // icône « Voir cette photo dans Immich » sur le bureau
+	AutoUpdate         bool     `json:"auto_update"`      // mises à jour automatiques depuis GitHub
 }
 
 func defaultConfig() Config {
@@ -41,6 +42,7 @@ func defaultConfig() Config {
 		ShowPlace:       true,
 		CaptionPosition: "bottom-right",
 		DesktopLink:     true,
+		AutoUpdate:      true,
 	}
 }
 

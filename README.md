@@ -16,6 +16,10 @@ Deux versions natives : `ImmichWallpaper-x64.exe` (PC Intel/AMD) et `ImmichWallp
 
 **Mise à jour** : lance simplement le nouvel exe téléchargé, il propose de remplacer la version installée (il arrête l'ancienne lui-même, la config est conservée).
 
+## Mises à jour automatiques
+
+L'appli vérifie les [releases](../../releases) de ce dépôt 2 min après le démarrage puis une fois par jour. Si une version plus récente existe, elle télécharge l'exe de son architecture, vérifie son empreinte avec `SHA256SUMS.txt`, se remplace (l'exe en cours est renommé en `.old`, Windows interdisant de l'écraser) et redémarre. Désactivable dans les réglages ; menu de l'icône → **Rechercher une mise à jour** pour forcer la vérification.
+
 ## Désinstallation
 
 *Paramètres → Applications → Applications installées → Immich Wallpaper → Désinstaller*, ou menu de l'icône → **Désinstaller…**.
@@ -82,10 +86,12 @@ Les fichiers `rsrc_windows_*.syso` contiennent l'icône et le manifeste (DPI, co
 | `render.go`, `caption.go` | recadrage, carte lieu/date |
 | `settings.go`, `settings.html` | page de réglages locale |
 | `win_windows.go`, `install_windows.go` | API Windows, installation/désinstallation |
+| `update.go`, `update_windows.go` | mise à jour depuis les releases GitHub |
+| `version.go` | version (injectée par la pipeline à partir du tag) |
 
 ### Publier une version
 
 ```sh
 git tag v1.4.0 && git push origin v1.4.0
 ```
-La pipeline compile les deux exe et crée la release GitHub correspondante. Chaque push sur `main` produit aussi les exe en artefacts de build.
+La pipeline compile les deux exe et crée la release GitHub correspondante ; les applis installées se mettent à jour d'elles-mêmes dans les 24 h. Chaque push sur `main` produit aussi les exe en artefacts de build.

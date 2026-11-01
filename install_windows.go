@@ -16,9 +16,6 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-// appVersion est remplacée au build par la pipeline (-X main.appVersion=...).
-var appVersion = "1.4"
-
 const (
 	uninstallKey = `Software\Microsoft\Windows\CurrentVersion\Uninstall\ImmichWallpaper`
 	mbYesNo      = 0x4

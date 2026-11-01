@@ -35,6 +35,7 @@ type App struct {
 	paused   bool
 	status   string
 	busy     atomic.Bool
+	updating atomic.Bool
 	mStatus  *systray.MenuItem
 	mOpenPic *systray.MenuItem
 }
@@ -49,13 +50,18 @@ func main() {
 	if maybeInstall() {
 		return
 	}
-	if !singleInstance() {
+	if hasArg("--after-update") {
+		if !waitForInstance() {
+			return
+		}
+	} else if !singleInstance() {
 		msgBox("Immich Wallpaper", "L'application est déjà lancée (icône près de l'horloge).", mbIconInfo)
 		return
 	}
 	a := &App{dir: dataDir()}
 	os.MkdirAll(a.dir, 0o755)
 	writePID()
+	cleanupAfterUpdate()
 	a.cfgPath = filepath.Join(a.dir, "config.json")
 	a.logPath = filepath.Join(a.dir, "journal.txt")
 	if st, err := os.Stat(a.logPath); err == nil && st.Size() > 1<<20 {
@@ -64,7 +70,7 @@ func main() {
 	if f, err := os.OpenFile(a.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
 		log.SetOutput(io.MultiWriter(f))
 	}
-	log.Printf("--- démarrage, dossier %s", a.dir)
+	log.Printf("--- démarrage v%s, dossier %s", appVersion, a.dir)
 
 	a.core = newCore(a.dir, setWallpaper)
 	a.core.setLockScreen = setLockScreen
@@ -185,6 +191,7 @@ func (a *App) onReady() {
 	mPause := systray.AddMenuItemCheckbox("Pause", "Ne plus changer automatiquement", false)
 	mAuto := systray.AddMenuItemCheckbox("Démarrer avec Windows", "", autostartEnabled())
 	mLog := systray.AddMenuItem("Ouvrir le journal", "")
+	mUpdate := systray.AddMenuItem("Rechercher une mise à jour", "Version actuelle : "+appVersion)
 	mUninstall := systray.AddMenuItem("Désinstaller…", "Tout supprimer (programme, réglages, démarrage auto)")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quitter", "")
@@ -207,6 +214,8 @@ func (a *App) onReady() {
 		a.setStatus("Configuration à compléter")
 		shellOpen(a.settings.URL())
 	}
+
+	go a.updateLoop()
 
 	go func() {
 		t := time.NewTicker(10 * time.Second)
@@ -250,6 +259,8 @@ func (a *App) onReady() {
 				} else {
 					mAuto.Uncheck()
 				}
+			case <-mUpdate.ClickedCh:
+				go a.checkAndUpdate(true)
 			case <-mUninstall.ClickedCh:
 				// Lancé dans un processus séparé : il nous arrête puis supprime nos fichiers.
 				if self, err := os.Executable(); err == nil {
