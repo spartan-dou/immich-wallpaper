@@ -29,6 +29,7 @@ type Config struct {
 	AutoUpdate         bool     `json:"auto_update"`      // mises à jour automatiques depuis GitHub
 	MultiMonitor       string   `json:"multi_monitor"`    // same | different
 	OfflineCache       int      `json:"offline_cache"`    // nombre de photos gardées pour le mode hors ligne (0 = désactivé)
+	SplitWide          bool     `json:"split_wide"`       // écran très large (32:9) : deux photos côte à côte
 }
 
 func defaultConfig() Config {
@@ -47,6 +48,7 @@ func defaultConfig() Config {
 		AutoUpdate:      true,
 		MultiMonitor:    "same",
 		OfflineCache:    40,
+		SplitWide:       true,
 	}
 }
 

@@ -115,6 +115,7 @@
         <input type="number" id="offline_cache" min="0" max="500">
       </div>
     </div>
+    <label class="check" style="margin-top:12px"><input type="checkbox" id="split_wide"> Écran très large (32:9, « deux écrans en un ») : deux photos côte à côte</label>
     <div class="hint">Hors ligne : si Immich est injoignable (déplacement, VPN coupé…), la rotation continue avec les dernières photos téléchargées. 0 = désactivé.</div>
     <label class="check" style="margin-top:16px"><input type="checkbox" id="landscape_only"> Uniquement les photos en paysage</label>
     <label class="check"><input type="checkbox" id="change_on_start"> Changer d'image au démarrage</label>
@@ -177,7 +178,7 @@ function form() {
     show_place: $('show_place').checked, show_date: $('show_date').checked,
     caption_position: $('caption_position').value, lock_screen: $('lock_screen').checked,
     desktop_link: $('desktop_link').checked, auto_update: $('auto_update').checked,
-    multi_monitor: $('multi_monitor').value,
+    multi_monitor: $('multi_monitor').value, split_wide: $('split_wide').checked,
     offline_cache: Math.max(0, parseInt($('offline_cache').value, 10) || 0),
   };
 }
@@ -222,6 +223,7 @@ async function load() {
   $('desktop_link').checked = c.desktop_link !== false;
   $('auto_update').checked = c.auto_update !== false;
   $('multi_monitor').value = c.multi_monitor || 'same';
+  $('split_wide').checked = c.split_wide !== false;
   $('offline_cache').value = c.offline_cache ?? 40;
   selected = new Set(c.albums || []);
   render();

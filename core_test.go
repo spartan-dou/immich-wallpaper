@@ -153,3 +153,45 @@ func TestMultiMonitor(t *testing.T) {
 		t.Fatal("deux photos différentes attendues", core.recent)
 	}
 }
+
+func TestSplitWide(t *testing.T) {
+	srv, _ := newProxy(t)
+	var applied, style string
+	core := newCore(t.TempDir(), func(p, s string) error { applied, style = p, s; return nil })
+	core.screen = func(string) Screen { return Screen{W: 5120, H: 1440, BottomInset: 48} }
+	cfg := testCfg(srv.URL, alb1, alb2)
+	cfg.LandscapeOnly = false
+	core.SetConfig(cfg)
+	if _, err := core.Next(); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := os.Open(applied)
+	ic, _, _ := image.DecodeConfig(f)
+	f.Close()
+	if ic.Width != 5120 || ic.Height != 1440 || style != "fill" {
+		t.Fatalf("%dx%d %s", ic.Width, ic.Height, style)
+	}
+	if len(core.recent) != 2 || core.recent[0] == core.recent[1] {
+		t.Fatal("deux photos différentes attendues sur l'écran 32:9", core.recent)
+	}
+	// 21:9 : pas de découpe.
+	core.screen = func(string) Screen { return Screen{W: 3440, H: 1440} }
+	core.recent = nil
+	core.Next()
+	if len(core.recent) != 1 {
+		t.Fatal("un 21:9 ne doit pas être découpé", core.recent)
+	}
+	// Multi-écrans : 16:9 + 32:9 → 3 photos.
+	core.monitors = func() []Monitor {
+		return []Monitor{{"a", Screen{W: 1920, H: 1080}}, {"b", Screen{W: 5120, H: 1440}}}
+	}
+	core.setMonitorWallpapers = func(map[string]string, string) error { return nil }
+	cfg2 := *cfg
+	cfg2.MultiMonitor = "different"
+	core.SetConfig(&cfg2)
+	core.recent = nil
+	core.Next()
+	if len(core.recent) != 3 {
+		t.Fatal("3 photos attendues (1 + 2)", core.recent)
+	}
+}

@@ -19,6 +19,7 @@ Deux versions natives : `ImmichWallpaper-x64.exe` (PC Intel/AMD) et `ImmichWallp
 ## Plusieurs écrans et mode hors ligne
 
 - **Une image différente par écran** (réglages → Affichage → Plusieurs écrans) : chaque photo est rendue à la résolution exacte de son écran, avec sa propre légende (interface Windows `IDesktopWallpaper`). L'écran de verrouillage reprend la photo de l'écran principal.
+- **Écran très large** (32:9, « deux écrans en un ») : deux photos côte à côte, chacune dans un panneau 16:9 avec sa légende vers le bord extérieur, au lieu d'une seule photo très rognée. Les 21:9 ne sont pas découpés. Désactivable dans les réglages.
 - **Hors ligne** : les dernières photos téléchargées (40 par défaut) sont gardées dans `%APPDATA%\ImmichWallpaper\cache`. Si Immich est injoignable, la rotation continue avec elles ; le menu de l'icône l'indique.
 - **Albums** : l'appli vérifie toutes les 30 min la liste des albums (une seule requête) et ne recharge le contenu que des albums modifiés (nombre de photos ou date de modification changés).
 

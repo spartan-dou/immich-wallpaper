@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/draw"
 	"image/jpeg"
 	"log"
 	"math/rand"
@@ -380,7 +381,19 @@ func (c *Core) Next() (Result, error) {
 			mons = m
 		}
 	}
-	n := max(1, len(mons))
+	// Nombre de photos : une par écran, deux pour un écran très large (32:9) découpé en deux panneaux.
+	var single Screen
+	n := 0
+	if mons == nil {
+		if c.screen != nil {
+			single = c.screen(c.cfg.Style)
+		}
+		n = c.panels(single)
+	} else {
+		for _, m := range mons {
+			n += c.panels(m.Screen)
+		}
+	}
 
 	res := Result{}
 	photos, err := c.fetchPhotos(n)
@@ -398,7 +411,7 @@ func (c *Core) Next() (Result, error) {
 
 	var primaryPath string
 	if mons == nil {
-		primaryPath, err = c.applySingle(photos[0])
+		primaryPath, err = c.applySingle(photos, single)
 	} else {
 		primaryPath, err = c.applyMulti(photos, mons)
 	}
@@ -440,16 +453,26 @@ func (c *Core) nextName(prefix string) string {
 	return filepath.Join(c.dir, prefix+"_"+s+".jpg")
 }
 
-func (c *Core) applySingle(p Photo) (string, error) {
+// Écran « très large » à partir de ce rapport largeur/hauteur (32:9 ≈ 3,56 ; 21:9 ≈ 2,39 n'est pas découpé).
+const splitRatio = 2.8
+
+// panels : nombre de photos à afficher sur cet écran (2 si très large et option active).
+func (c *Core) panels(sc Screen) int {
+	if c.cfg.SplitWide && sc.H > 0 && float64(sc.W)/float64(sc.H) >= splitRatio {
+		return 2
+	}
+	return 1
+}
+
+func (c *Core) applySingle(photos []Photo, sc Screen) (string, error) {
 	style := c.cfg.Style
 	var jpg []byte
 	var err error
-	if c.wantInfo() && c.screen != nil {
-		sc := c.screen(c.cfg.Style)
-		jpg, err = c.render(p, sc)
+	if (c.wantInfo() || len(photos) > 1) && sc.W > 0 {
+		jpg, err = c.render(photos, sc)
 		style = "fill" // l'image fait déjà la taille de l'écran
 	} else {
-		jpg, err = encodeJPEG(p.Img)
+		jpg, err = encodeJPEG(photos[0].Img)
 	}
 	if err != nil {
 		return "", err
@@ -462,12 +485,15 @@ func (c *Core) applySingle(p Photo) (string, error) {
 	return path, c.setWallpaper(path, style)
 }
 
-// applyMulti rend chaque photo à la taille exacte de son écran puis les applique.
+// applyMulti rend les photos de chaque écran à sa taille exacte puis les applique.
 func (c *Core) applyMulti(photos []Photo, mons []Monitor) (string, error) {
 	paths := map[string]string{}
 	var primary string
+	k := 0
 	for i, m := range mons {
-		jpg, err := c.render(photos[i], m.Screen)
+		np := c.panels(m.Screen)
+		jpg, err := c.render(photos[k:k+np], m.Screen)
+		k += np
 		if err != nil {
 			return "", err
 		}
@@ -484,20 +510,47 @@ func (c *Core) applyMulti(photos []Photo, mons []Monitor) (string, error) {
 	return primary, c.setMonitorWallpapers(paths, "fill")
 }
 
-// render recadre la photo à la taille de l'écran et y incruste lieu/date si demandé.
-func (c *Core) render(p Photo, sc Screen) ([]byte, error) {
+// render produit l'image d'un écran : une photo, ou deux côte à côte (écran très large),
+// séparées par une fine bande sombre, chacune avec sa légende vers le bord extérieur.
+func (c *Core) render(photos []Photo, sc Screen) ([]byte, error) {
 	if sc.W < 320 || sc.H < 240 {
 		return nil, fmt.Errorf("taille d'écran inattendue %dx%d", sc.W, sc.H)
 	}
+	if len(photos) == 1 {
+		return encodeJPEG(c.renderPanel(photos[0], sc, c.cfg.CaptionPosition))
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, sc.W, sc.H))
+	gap := max(2, sc.H/270) // ≈ 4 px en 1080p, 5 px en 1440p
+	pw := (sc.W - gap*(len(photos)-1)) / len(photos)
+	x := 0
+	for i, p := range photos {
+		w := pw
+		if i == len(photos)-1 {
+			w = sc.W - x
+		}
+		pos := c.cfg.CaptionPosition
+		if i == 0 && len(photos) == 2 { // panneau gauche : légende côté gauche (bord extérieur)
+			pos = strings.Replace(pos, "right", "left", 1)
+		} else if i == len(photos)-1 {
+			pos = strings.Replace(pos, "left", "right", 1)
+		}
+		panel := c.renderPanel(p, Screen{W: w, H: sc.H, BottomInset: sc.BottomInset}, pos)
+		draw.Draw(dst, image.Rect(x, 0, x+w, sc.H), panel, image.Point{}, draw.Src)
+		x += w + gap
+	}
+	return encodeJPEG(dst)
+}
+
+func (c *Core) renderPanel(p Photo, sc Screen, pos string) *image.RGBA {
 	dst := compose(p.Img, sc, c.cfg.Style)
 	if c.wantInfo() {
 		place, date := captionParts(p.Info, c.cfg.ShowPlace, c.cfg.ShowDate)
 		if c.fonts == nil {
 			c.fonts = loadFonts()
 		}
-		drawCaption(dst, c.fonts, place, date, c.cfg.CaptionPosition, sc.BottomInset)
+		drawCaption(dst, c.fonts, place, date, pos, sc.BottomInset)
 	}
-	return encodeJPEG(dst)
+	return dst
 }
 
 // prepareImage vérifie que l'image est lisible et son orientation (EXIF compris).
