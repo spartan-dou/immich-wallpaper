@@ -102,6 +102,20 @@
         </select>
       </div>
     </div>
+    <div class="row" style="grid-template-columns: 1fr 1fr; margin-top:6px">
+      <div>
+        <label for="multi_monitor">Plusieurs écrans</label>
+        <select id="multi_monitor">
+          <option value="same">La même image partout</option>
+          <option value="different">Une image différente par écran</option>
+        </select>
+      </div>
+      <div>
+        <label for="offline_cache">Photos gardées hors ligne</label>
+        <input type="number" id="offline_cache" min="0" max="500">
+      </div>
+    </div>
+    <div class="hint">Hors ligne : si Immich est injoignable (déplacement, VPN coupé…), la rotation continue avec les dernières photos téléchargées. 0 = désactivé.</div>
     <label class="check" style="margin-top:16px"><input type="checkbox" id="landscape_only"> Uniquement les photos en paysage</label>
     <label class="check"><input type="checkbox" id="change_on_start"> Changer d'image au démarrage</label>
   </section>
@@ -163,6 +177,8 @@ function form() {
     show_place: $('show_place').checked, show_date: $('show_date').checked,
     caption_position: $('caption_position').value, lock_screen: $('lock_screen').checked,
     desktop_link: $('desktop_link').checked, auto_update: $('auto_update').checked,
+    multi_monitor: $('multi_monitor').value,
+    offline_cache: Math.max(0, parseInt($('offline_cache').value, 10) || 0),
   };
 }
 
@@ -205,6 +221,8 @@ async function load() {
   $('lock_screen').checked = !!c.lock_screen;
   $('desktop_link').checked = c.desktop_link !== false;
   $('auto_update').checked = c.auto_update !== false;
+  $('multi_monitor').value = c.multi_monitor || 'same';
+  $('offline_cache').value = c.offline_cache ?? 40;
   selected = new Set(c.albums || []);
   render();
   if (c.has_key && c.server_url) testConn(true);

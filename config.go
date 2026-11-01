@@ -27,6 +27,8 @@ type Config struct {
 	CaptionPosition    string   `json:"caption_position"` // bottom-right | bottom-left | top-right | top-left
 	DesktopLink        bool     `json:"desktop_link"`     // icône « Voir cette photo dans Immich » sur le bureau
 	AutoUpdate         bool     `json:"auto_update"`      // mises à jour automatiques depuis GitHub
+	MultiMonitor       string   `json:"multi_monitor"`    // same | different
+	OfflineCache       int      `json:"offline_cache"`    // nombre de photos gardées pour le mode hors ligne (0 = désactivé)
 }
 
 func defaultConfig() Config {
@@ -43,6 +45,8 @@ func defaultConfig() Config {
 		CaptionPosition: "bottom-right",
 		DesktopLink:     true,
 		AutoUpdate:      true,
+		MultiMonitor:    "same",
+		OfflineCache:    40,
 	}
 }
 
@@ -148,6 +152,10 @@ func (c *Config) normalize() error {
 	if c.Style == "" {
 		c.Style = "fill"
 	}
+	if c.MultiMonitor != "different" {
+		c.MultiMonitor = "same"
+	}
+	c.OfflineCache = min(max(c.OfflineCache, 0), 500)
 	switch c.CaptionPosition {
 	case "bottom-right", "bottom-left", "top-right", "top-left":
 	default:

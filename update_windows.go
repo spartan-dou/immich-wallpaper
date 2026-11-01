@@ -3,6 +3,9 @@ package main
 import (
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"fyne.io/systray"
@@ -28,25 +31,83 @@ func replaceSelf(bin []byte) (string, error) {
 	return self, nil
 }
 
-// cleanupAfterUpdate supprime l'ancien exe (.old) une fois l'ancienne instance terminée,
-// et met à jour la version affichée dans « Applications installées ».
+// cleanupAfterUpdate : ménage au démarrage et version affichée dans « Applications installées ».
+// Après une mise à jour, l'ancien exe (.old) n'est supprimé qu'une fois la nouvelle version
+// déclarée en bonne santé (voir reportHealthy), pour permettre un retour arrière.
 func cleanupAfterUpdate() {
 	self, err := os.Executable()
 	if err != nil {
 		return
 	}
-	go func() {
-		for i := 0; i < 30; i++ {
-			if err := os.Remove(self + ".old"); err == nil || os.IsNotExist(err) {
-				return
-			}
-			time.Sleep(time.Second)
-		}
-	}()
+	os.Remove(self + ".bad")
+	if !hasArg("--after-update") {
+		os.Remove(self + ".old")
+	}
 	if samePath(self, installedExe()) {
 		if k, err := registry.OpenKey(registry.CURRENT_USER, uninstallKey, registry.SET_VALUE); err == nil {
 			k.SetStringValue("DisplayVersion", appVersion)
 			k.Close()
+		}
+	}
+}
+
+func healthFile() string { return filepath.Join(dataDir(), "update_ok") }
+func skipFile() string   { return filepath.Join(dataDir(), "skip_version") }
+
+// reportHealthy : la nouvelle version tourne depuis 20 s → elle le signale à l'ancienne,
+// qui peut alors se terminer ; on supprime ensuite l'ancien exe.
+func reportHealthy() {
+	time.Sleep(20 * time.Second)
+	os.WriteFile(healthFile(), []byte(appVersion), 0o644)
+	log.Printf("mise à jour vers %s validée", appVersion)
+	self, err := os.Executable()
+	if err != nil {
+		return
+	}
+	for i := 0; i < 120; i++ {
+		if err := os.Remove(self + ".old"); err == nil || os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// pendingUpdate : nouvelle version lancée, à surveiller avant de quitter.
+type pendingUpdate struct {
+	self, version string
+	cmd           *exec.Cmd
+}
+
+// watch attend le signal de bonne santé de la nouvelle version. Si elle s'arrête avant
+// (plantage au démarrage), on remet l'ancien exe en place, on le relance et on ignore
+// cette version pour les mises à jour automatiques.
+func (p *pendingUpdate) watch() {
+	exited := make(chan struct{})
+	go func() { p.cmd.Wait(); close(exited) }()
+	deadline := time.After(90 * time.Second)
+	for {
+		if b, err := os.ReadFile(healthFile()); err == nil && string(b) == p.version {
+			os.Remove(healthFile())
+			return
+		}
+		select {
+		case <-exited:
+			if _, err := os.Stat(healthFile()); err == nil {
+				return
+			}
+			log.Printf("la version %s s'est arrêtée au démarrage : retour à %s", p.version, appVersion)
+			bad := p.self + ".bad"
+			os.Remove(bad)
+			if os.Rename(p.self, bad) != nil || os.Rename(p.self+".old", p.self) != nil {
+				log.Printf("retour arrière impossible")
+				return
+			}
+			os.WriteFile(skipFile(), []byte(p.version), 0o644)
+			hiddenCmd(p.self, "--after-update").Start()
+			return
+		case <-deadline:
+			return // toujours en vie sans signal : on la laisse tourner
+		case <-time.After(time.Second):
 		}
 	}
 }
@@ -83,6 +144,12 @@ func (a *App) checkAndUpdate(manual bool) {
 		}
 		return
 	}
+	if u != nil && !manual {
+		if b, err := os.ReadFile(skipFile()); err == nil && strings.TrimSpace(string(b)) == u.Version {
+			log.Printf("version %s ignorée (échec au démarrage précédemment)", u.Version)
+			return
+		}
+	}
 	if u == nil {
 		if manual {
 			msgBox("Immich Wallpaper", "Immich Wallpaper est à jour (version "+appVersion+").", mbIconInfo)
@@ -109,11 +176,17 @@ func (a *App) checkAndUpdate(manual bool) {
 		return
 	}
 	log.Printf("mise à jour installée, redémarrage")
+	os.Remove(healthFile())
 	releaseInstance()
-	if err := hiddenCmd(self, "--after-update").Start(); err != nil {
+	cmd := hiddenCmd(self, "--after-update")
+	if err := cmd.Start(); err != nil {
 		log.Printf("redémarrage impossible : %v", err)
+		os.Rename(self, self+".bad")
+		os.Rename(self+".old", self)
+		singleInstance()
 		return
 	}
+	a.pending = &pendingUpdate{self: self, version: u.Version, cmd: cmd}
 	systray.Quit()
 }
 

@@ -16,9 +16,15 @@ Deux versions natives : `ImmichWallpaper-x64.exe` (PC Intel/AMD) et `ImmichWallp
 
 **Mise à jour** : lance simplement le nouvel exe téléchargé, il propose de remplacer la version installée (il arrête l'ancienne lui-même, la config est conservée).
 
+## Plusieurs écrans et mode hors ligne
+
+- **Une image différente par écran** (réglages → Affichage → Plusieurs écrans) : chaque photo est rendue à la résolution exacte de son écran, avec sa propre légende (interface Windows `IDesktopWallpaper`). L'écran de verrouillage reprend la photo de l'écran principal.
+- **Hors ligne** : les dernières photos téléchargées (40 par défaut) sont gardées dans `%APPDATA%\ImmichWallpaper\cache`. Si Immich est injoignable, la rotation continue avec elles ; le menu de l'icône l'indique.
+- **Albums** : l'appli vérifie toutes les 30 min la liste des albums (une seule requête) et ne recharge le contenu que des albums modifiés (nombre de photos ou date de modification changés).
+
 ## Mises à jour automatiques
 
-L'appli vérifie les [releases](../../releases) de ce dépôt 2 min après le démarrage puis une fois par jour. Si une version plus récente existe, elle télécharge l'exe de son architecture, vérifie son empreinte avec `SHA256SUMS.txt`, se remplace (l'exe en cours est renommé en `.old`, Windows interdisant de l'écraser) et redémarre. Désactivable dans les réglages ; menu de l'icône → **Rechercher une mise à jour** pour forcer la vérification.
+L'appli vérifie les [releases](../../releases) de ce dépôt 2 min après le démarrage puis une fois par jour. Si une version plus récente existe, elle télécharge l'exe de son architecture, vérifie son empreinte avec `SHA256SUMS.txt`, se remplace (l'exe en cours est renommé en `.old`, Windows interdisant de l'écraser) et redémarre. L'ancienne version surveille le démarrage de la nouvelle : si celle-ci s'arrête dans les premières secondes, elle se remet en place et cette version est ignorée par les mises à jour automatiques. Désactivable dans les réglages ; menu de l'icône → **Rechercher une mise à jour** pour forcer la vérification.
 
 ## Désinstallation
 
@@ -86,6 +92,7 @@ Les fichiers `rsrc_windows_*.syso` contiennent l'icône et le manifeste (DPI, co
 | `render.go`, `caption.go` | recadrage, carte lieu/date |
 | `settings.go`, `settings.html` | page de réglages locale |
 | `win_windows.go`, `install_windows.go` | API Windows, installation/désinstallation |
+| `monitors_windows.go` | une image par écran (COM `IDesktopWallpaper`) |
 | `update.go`, `update_windows.go` | mise à jour depuis les releases GitHub |
 | `version.go` | version (injectée par la pipeline à partir du tag) |
 

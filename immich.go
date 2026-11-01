@@ -169,9 +169,25 @@ func (c *Client) AssetInfo(id string) (AssetInfo, error) {
 }
 
 type AlbumInfo struct {
-	ID         string `json:"id"`
-	AlbumName  string `json:"albumName"`
-	AssetCount int    `json:"assetCount"`
+	ID                         string `json:"id"`
+	AlbumName                  string `json:"albumName"`
+	AssetCount                 int    `json:"assetCount"`
+	UpdatedAt                  string `json:"updatedAt"`
+	LastModifiedAssetTimestamp string `json:"lastModifiedAssetTimestamp"`
+}
+
+// AlbumSignatures renvoie, pour chaque album accessible, une empreinte qui change dès qu'une
+// photo est ajoutée, retirée ou modifiée (une seule requête pour tous les albums).
+func (c *Client) AlbumSignatures() (map[string]string, error) {
+	albums, err := c.Albums()
+	if err != nil {
+		return nil, err
+	}
+	sigs := make(map[string]string, len(albums))
+	for _, a := range albums {
+		sigs[a.ID] = fmt.Sprintf("%d|%s|%s", a.AssetCount, a.LastModifiedAssetTimestamp, a.UpdatedAt)
+	}
+	return sigs, nil
 }
 
 // Albums liste les albums possédés et partagés avec l'utilisateur du token.

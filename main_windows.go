@@ -36,6 +36,7 @@ type App struct {
 	status   string
 	busy     atomic.Bool
 	updating atomic.Bool
+	pending  *pendingUpdate
 	mStatus  *systray.MenuItem
 	mOpenPic *systray.MenuItem
 }
@@ -75,6 +76,8 @@ func main() {
 	a.core = newCore(a.dir, setWallpaper)
 	a.core.setLockScreen = setLockScreen
 	a.core.screen = screenFor
+	a.core.monitors = listMonitors
+	a.core.setMonitorWallpapers = setMonitorWallpapers
 	a.core.afterApply = updateDesktopLink
 	var err error
 	a.settings, err = startSettingsServer(a.cfgPath)
@@ -93,6 +96,9 @@ func main() {
 	a.settings.Status = a.getStatus
 
 	systray.Run(a.onReady, func() { log.Printf("--- arrêt") })
+	if a.pending != nil {
+		a.pending.watch() // surveille le démarrage de la nouvelle version (retour arrière si plantage)
+	}
 }
 
 func (a *App) setStatus(s string) {
@@ -145,7 +151,8 @@ func (a *App) change() (Asset, error) {
 	}
 	defer a.busy.Store(false)
 	a.setStatus("Téléchargement…")
-	as, err := a.core.Next()
+	res, err := a.core.Next()
+	as := res.Asset
 
 	a.mu.Lock()
 	interval := 60 * time.Minute
@@ -168,6 +175,12 @@ func (a *App) change() (Asset, error) {
 		return as, err
 	}
 	st := as.OriginalFileName
+	if res.Offline {
+		st = "Hors ligne (photo du cache) : " + st
+		if errors.Is(res.Cause, errUnauthorized) {
+			st = "Token refusé, photo du cache : " + as.OriginalFileName
+		}
+	}
 	if a.core.LockError() != nil {
 		st += " (écran de verrouillage : échec, voir le journal)"
 	}
@@ -216,6 +229,9 @@ func (a *App) onReady() {
 	}
 
 	go a.updateLoop()
+	if hasArg("--after-update") {
+		go reportHealthy()
+	}
 
 	go func() {
 		t := time.NewTicker(10 * time.Second)

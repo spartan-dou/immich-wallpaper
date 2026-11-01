@@ -106,10 +106,11 @@ func TestCoreNext(t *testing.T) {
 	core.SetConfig(cfg)
 	seen := map[string]bool{}
 	for i := 0; i < 6; i++ {
-		a, err := core.Next()
+		r, err := core.Next()
 		if err != nil {
 			t.Fatal(err)
 		}
+		a := r.Asset
 		if a.ID == "p1" {
 			t.Fatal("portrait choisi alors que landscape_only")
 		}
@@ -138,9 +139,9 @@ func TestPortraitFallback(t *testing.T) {
 	cfg := &Config{ServerURL: srv.URL, APIKey: key, Albums: []string{alb1}, LandscapeOnly: true}
 	cfg.normalize()
 	core.SetConfig(cfg)
-	a, err := core.Next()
-	if err != nil || a.ID != "p1" {
-		t.Fatal(a, err)
+	r, err := core.Next()
+	if err != nil || r.Asset.ID != "p1" {
+		t.Fatal(r, err)
 	}
 }
 

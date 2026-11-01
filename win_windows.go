@@ -39,14 +39,7 @@ func setWallpaper(path, style string) error {
 		k.SetStringValue("TileWallpaper", tile)
 		k.Close()
 	}
-	// Repasse l'arrière-plan en mode « Image » si « Windows à la une » ou un diaporama était actif,
-	// sinon Windows peut remettre ses propres images par-dessus.
-	if k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers`, registry.QUERY_VALUE|registry.SET_VALUE); err == nil {
-		if v, _, err := k.GetIntegerValue("BackgroundType"); err == nil && v != 0 {
-			k.SetDWordValue("BackgroundType", 0)
-		}
-		k.Close()
-	}
+	setBackgroundTypePicture()
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return err
@@ -203,3 +196,16 @@ func updateDesktopLink(cfg *Config, a Asset, webURL string) {
 }
 
 func removeDesktopLink() { os.Remove(desktopLinkPath()) }
+
+// setBackgroundTypePicture repasse l'arrière-plan en mode « Image » si « Windows à la une »
+// ou un diaporama était actif, sinon Windows peut remettre ses propres images par-dessus.
+func setBackgroundTypePicture() {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers`, registry.QUERY_VALUE|registry.SET_VALUE)
+	if err != nil {
+		return
+	}
+	defer k.Close()
+	if v, _, err := k.GetIntegerValue("BackgroundType"); err == nil && v != 0 {
+		k.SetDWordValue("BackgroundType", 0)
+	}
+}
