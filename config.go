@@ -30,6 +30,7 @@ type Config struct {
 	MultiMonitor       string   `json:"multi_monitor"`    // same | different
 	OfflineCache       int      `json:"offline_cache"`    // nombre de photos gardées pour le mode hors ligne (0 = désactivé)
 	SplitWide          bool     `json:"split_wide"`       // écran très large (32:9) : deux photos côte à côte
+	ChangeOnUnlock     bool     `json:"change_on_unlock"` // nouvelle photo à chaque déverrouillage de session
 }
 
 func defaultConfig() Config {
@@ -49,6 +50,7 @@ func defaultConfig() Config {
 		MultiMonitor:    "same",
 		OfflineCache:    40,
 		SplitWide:       true,
+		ChangeOnUnlock:  true,
 	}
 }
 

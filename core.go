@@ -63,6 +63,7 @@ type Core struct {
 	lastOK        bool
 	lockErr       error
 	fonts         *Fonts
+	lastPhotos    []Photo // photos affichées, réutilisées si les écrans changent
 
 	// Fonctions fournies par la plateforme (Windows) ; remplacées par des faux dans les tests.
 	setWallpaper         func(path, style string) error
@@ -367,6 +368,59 @@ type Result struct {
 	Cause   error // pourquoi on est passé hors ligne
 }
 
+// targets détermine les écrans à couvrir et le nombre de photos nécessaires
+// (une par écran, deux pour un écran très large découpé en deux panneaux).
+func (c *Core) targets() (mons []Monitor, single Screen, n int) {
+	if c.cfg.MultiMonitor == "different" && c.monitors != nil && c.setMonitorWallpapers != nil {
+		if m := c.monitors(); len(m) > 1 {
+			mons = m
+		}
+	}
+	if mons == nil {
+		if c.screen != nil {
+			single = c.screen(c.cfg.Style)
+		}
+		return nil, single, c.panels(single)
+	}
+	for _, m := range mons {
+		n += c.panels(m.Screen)
+	}
+	return mons, single, n
+}
+
+func (c *Core) applyTo(photos []Photo, mons []Monitor, single Screen) (string, error) {
+	if mons == nil {
+		return c.applySingle(photos, single)
+	}
+	return c.applyMulti(photos, mons)
+}
+
+// Reapply recalcule le fond d'écran avec les photos actuelles pour la configuration d'écrans
+// courante (branchement, résolution…). S'il faut plus de photos qu'avant, on en tire de nouvelles.
+func (c *Core) Reapply() (Result, error) {
+	c.mu.Lock()
+	if c.cfg == nil {
+		c.mu.Unlock()
+		return Result{}, errors.New("configuration incomplète")
+	}
+	mons, single, n := c.targets()
+	if len(c.lastPhotos) < n {
+		c.mu.Unlock()
+		log.Printf("écrans modifiés : %d photo(s) nécessaire(s), nouveau tirage", n)
+		return c.Next()
+	}
+	defer c.mu.Unlock()
+	path, err := c.applyTo(c.lastPhotos[:n], mons, single)
+	if err != nil {
+		return Result{}, err
+	}
+	log.Printf("écrans modifiés : fond d'écran recalculé (%d photo(s))", n)
+	if c.cfg.LockScreen && c.setLockScreen != nil {
+		c.setLockScreen(path)
+	}
+	return Result{Asset: c.lastPhotos[0].Asset}, nil
+}
+
 // Next choisit et applique de nouvelles images (une par écran si demandé).
 func (c *Core) Next() (Result, error) {
 	c.mu.Lock()
@@ -375,25 +429,7 @@ func (c *Core) Next() (Result, error) {
 		return Result{}, errors.New("configuration incomplète : ouvre les paramètres")
 	}
 
-	var mons []Monitor
-	if c.cfg.MultiMonitor == "different" && c.monitors != nil && c.setMonitorWallpapers != nil {
-		if m := c.monitors(); len(m) > 1 {
-			mons = m
-		}
-	}
-	// Nombre de photos : une par écran, deux pour un écran très large (32:9) découpé en deux panneaux.
-	var single Screen
-	n := 0
-	if mons == nil {
-		if c.screen != nil {
-			single = c.screen(c.cfg.Style)
-		}
-		n = c.panels(single)
-	} else {
-		for _, m := range mons {
-			n += c.panels(m.Screen)
-		}
-	}
+	mons, single, n := c.targets()
 
 	res := Result{}
 	photos, err := c.fetchPhotos(n)
@@ -409,15 +445,11 @@ func (c *Core) Next() (Result, error) {
 		photos = append(photos, photos[i%orig])
 	}
 
-	var primaryPath string
-	if mons == nil {
-		primaryPath, err = c.applySingle(photos, single)
-	} else {
-		primaryPath, err = c.applyMulti(photos, mons)
-	}
+	primaryPath, err := c.applyTo(photos, mons, single)
 	if err != nil {
 		return Result{}, err
 	}
+	c.lastPhotos = photos
 
 	pool := len(c.assets)
 	if res.Offline {

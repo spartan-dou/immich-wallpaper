@@ -20,6 +20,7 @@ Deux versions natives : `ImmichWallpaper-x64.exe` (PC Intel/AMD) et `ImmichWallp
 
 - **Une image différente par écran** (réglages → Affichage → Plusieurs écrans) : chaque photo est rendue à la résolution exacte de son écran, avec sa propre légende (interface Windows `IDesktopWallpaper`). L'écran de verrouillage reprend la photo de l'écran principal.
 - **Écran très large** (32:9, « deux écrans en un ») : deux photos côte à côte, chacune dans un panneau 16:9 avec sa légende vers le bord extérieur, au lieu d'une seule photo très rognée. Les 21:9 ne sont pas découpés. Désactivable dans les réglages.
+- **Déverrouillage et changements d'écran** : nouvelle photo à chaque déverrouillage du PC (désactivable) ; quand un écran est branché/débranché, change de résolution ou se rallume, le fond d'écran est recalculé avec les photos actuelles (nouveau tirage seulement s'il en faut davantage, ex. écran 32:9 ajouté). Événements reçus par une fenêtre cachée (`WM_WTSSESSION_CHANGE`, `WM_DISPLAYCHANGE`, état d'affichage de la console), regroupés sur 3 s.
 - **Hors ligne** : les dernières photos téléchargées (40 par défaut) sont gardées dans `%APPDATA%\ImmichWallpaper\cache`. Si Immich est injoignable, la rotation continue avec elles ; le menu de l'icône l'indique.
 - **Albums** : l'appli vérifie toutes les 30 min la liste des albums (une seule requête) et ne recharge le contenu que des albums modifiés (nombre de photos ou date de modification changés).
 
@@ -94,6 +95,7 @@ Les fichiers `rsrc_windows_*.syso` contiennent l'icône et le manifeste (DPI, co
 | `settings.go`, `settings.html` | page de réglages locale |
 | `win_windows.go`, `install_windows.go` | API Windows, installation/désinstallation |
 | `monitors_windows.go` | une image par écran (COM `IDesktopWallpaper`) |
+| `events_windows.go` | déverrouillage, changements d'écran, sortie de veille |
 | `update.go`, `update_windows.go` | mise à jour depuis les releases GitHub |
 | `version.go` | version (injectée par la pipeline à partir du tag) |
 

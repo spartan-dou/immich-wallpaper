@@ -232,6 +232,7 @@ func (a *App) onReady() {
 	if hasArg("--after-update") {
 		go reportHealthy()
 	}
+	go a.handleSystemEvents()
 
 	go func() {
 		t := time.NewTicker(10 * time.Second)
@@ -299,4 +300,60 @@ func hasArg(name string) bool {
 		}
 	}
 	return false
+}
+
+// handleSystemEvents réagit au déverrouillage et aux changements d'écran. Ces événements
+// arrivent souvent en rafale (plusieurs WM_DISPLAYCHANGE, déverrouillage + écran rallumé) :
+// on attend 3 s de calme, et un déverrouillage l'emporte sur un simple changement d'écran.
+func (a *App) handleSystemEvents() {
+	const (
+		evDisplay = 1
+		evUnlock  = 2
+	)
+	ch := make(chan int, 16)
+	send := func(e int) func() {
+		return func() {
+			select {
+			case ch <- e:
+			default:
+			}
+		}
+	}
+	go watchSystemEvents(&sysEvents{onDisplay: send(evDisplay), onUnlock: send(evUnlock)})
+
+	pending := 0
+	var timer <-chan time.Time
+	for {
+		select {
+		case e := <-ch:
+			pending = max(pending, e)
+			timer = time.After(3 * time.Second)
+		case <-timer:
+			a.mu.Lock()
+			cfg, paused := a.cfg, a.paused
+			a.mu.Unlock()
+			ev := pending
+			pending, timer = 0, nil
+			if cfg == nil {
+				continue
+			}
+			if ev == evUnlock && cfg.ChangeOnUnlock && !paused {
+				log.Printf("session déverrouillée : nouvelle image")
+				go a.change()
+			} else {
+				go a.reapply()
+			}
+		}
+	}
+}
+
+// reapply recalcule le fond d'écran (mêmes photos) pour la nouvelle configuration d'écrans.
+func (a *App) reapply() {
+	if !a.busy.CompareAndSwap(false, true) {
+		return
+	}
+	defer a.busy.Store(false)
+	if _, err := a.core.Reapply(); err != nil {
+		log.Printf("recalcul après changement d'écran : %v", err)
+	}
 }

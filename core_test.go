@@ -195,3 +195,52 @@ func TestSplitWide(t *testing.T) {
 		t.Fatal("3 photos attendues (1 + 2)", core.recent)
 	}
 }
+
+func TestReapply(t *testing.T) {
+	srv, st := newProxy(t)
+	var applied string
+	core := newCore(t.TempDir(), func(p, s string) error { applied = p; return nil })
+	sc := Screen{W: 1920, H: 1080}
+	core.screen = func(string) Screen { return sc }
+	cfg := testCfg(srv.URL, alb1, alb2)
+	cfg.LandscapeOnly = false
+	cfg.ShowDate = true // rendu à la taille de l'écran (sinon Windows ajuste lui-même)
+	core.SetConfig(cfg)
+	if _, err := core.Next(); err != nil {
+		t.Fatal(err)
+	}
+	first := core.lastPhotos[0].Asset.ID
+	downloads := func() int {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		n := 0
+		for k, v := range st.fetches {
+			if len(k) > 11 && k[:11] == "/api/assets" && k[len(k)-9:] == "thumbnail" {
+				n += v
+			}
+		}
+		return n
+	}
+	before := downloads()
+
+	// Nouvelle résolution : même photo, recalculée, aucun téléchargement.
+	sc = Screen{W: 2560, H: 1440}
+	if _, err := core.Reapply(); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := os.Open(applied)
+	ic, _, _ := image.DecodeConfig(f)
+	f.Close()
+	if ic.Width != 2560 || core.lastPhotos[0].Asset.ID != first || downloads() != before {
+		t.Fatalf("%dx%d, photo %s, téléchargements %d→%d", ic.Width, ic.Height, core.lastPhotos[0].Asset.ID, before, downloads())
+	}
+
+	// Écran 32:9 branché : il faut 2 photos → nouveau tirage.
+	sc = Screen{W: 5120, H: 1440}
+	if _, err := core.Reapply(); err != nil {
+		t.Fatal(err)
+	}
+	if len(core.lastPhotos) != 2 || downloads() == before {
+		t.Fatal("nouveau tirage attendu", len(core.lastPhotos))
+	}
+}
