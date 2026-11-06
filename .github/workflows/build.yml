@@ -26,7 +26,9 @@ jobs:
           go-version: stable
 
       - name: Dépendances
-        run: go mod tidy
+        run: |
+          go mod download
+          go mod verify
 
       - name: Vérifications
         run: |
