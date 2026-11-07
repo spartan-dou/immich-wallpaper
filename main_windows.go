@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +43,7 @@ type App struct {
 }
 
 func main() {
+	debug.SetMemoryLimit(256 << 20) // GC plus agressif au-delà : limite le pic de RAM
 	for _, arg := range os.Args[1:] {
 		if arg == "--uninstall" {
 			uninstall(hasArg("--quiet"))

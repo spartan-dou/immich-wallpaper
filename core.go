@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -41,6 +42,13 @@ type Photo struct {
 	Info  AssetInfo
 }
 
+// keptPhoto : photo affichée, gardée en JPEG (≈10× plus léger que l'image décodée).
+type keptPhoto struct {
+	Asset Asset
+	Info  AssetInfo
+	JPEG  []byte
+}
+
 type albumState struct {
 	sig    string
 	name   string
@@ -63,7 +71,7 @@ type Core struct {
 	lastOK        bool
 	lockErr       error
 	fonts         *Fonts
-	lastPhotos    []Photo // photos affichées, réutilisées si les écrans changent
+	lastPhotos    []keptPhoto // photos affichées (compressées), réutilisées si les écrans changent
 
 	// Fonctions fournies par la plateforme (Windows) ; remplacées par des faux dans les tests.
 	setWallpaper         func(path, style string) error
@@ -282,12 +290,7 @@ func (c *Core) saveToCache(p Photo) {
 	}
 	dir := c.cacheDir()
 	os.MkdirAll(dir, 0o755)
-	img := p.Img
-	if b := img.Bounds(); max(b.Dx(), b.Dy()) > 3840 {
-		s := 3840 / float64(max(b.Dx(), b.Dy()))
-		img = compose(img, Screen{W: int(float64(b.Dx()) * s), H: int(float64(b.Dy()) * s)}, "stretch")
-	}
-	jpg, err := encodeJPEG(img)
+	jpg, err := shrinkJPEG(p.Img)
 	if err != nil {
 		return
 	}
@@ -297,6 +300,15 @@ func (c *Core) saveToCache(p Photo) {
 		os.WriteFile(base+".json", meta, 0o644)
 	}
 	c.pruneCache()
+}
+
+// shrinkJPEG encode l'image en JPEG, redimensionnée à 3840 px max.
+func shrinkJPEG(img image.Image) ([]byte, error) {
+	if b := img.Bounds(); max(b.Dx(), b.Dy()) > 3840 {
+		s := 3840 / float64(max(b.Dx(), b.Dy()))
+		img = compose(img, Screen{W: int(float64(b.Dx()) * s), H: int(float64(b.Dy()) * s)}, "stretch")
+	}
+	return encodeJPEG(img)
 }
 
 func (c *Core) cachedIDs() []string {
@@ -410,7 +422,16 @@ func (c *Core) Reapply() (Result, error) {
 		return c.Next()
 	}
 	defer c.mu.Unlock()
-	path, err := c.applyTo(c.lastPhotos[:n], mons, single)
+	defer debug.FreeOSMemory()
+	photos := make([]Photo, 0, n)
+	for _, k := range c.lastPhotos[:n] {
+		img, err := jpeg.Decode(bytes.NewReader(k.JPEG))
+		if err != nil {
+			return Result{}, err
+		}
+		photos = append(photos, Photo{Asset: k.Asset, Img: img, Info: k.Info})
+	}
+	path, err := c.applyTo(photos, mons, single)
 	if err != nil {
 		return Result{}, err
 	}
@@ -423,6 +444,12 @@ func (c *Core) Reapply() (Result, error) {
 
 // Next choisit et applique de nouvelles images (une par écran si demandé).
 func (c *Core) Next() (Result, error) {
+	res, err := c.next()
+	debug.FreeOSMemory() // rend la RAM à Windows après le pic de décodage
+	return res, err
+}
+
+func (c *Core) next() (Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.cfg == nil {
@@ -449,7 +476,15 @@ func (c *Core) Next() (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	c.lastPhotos = photos
+	c.lastPhotos = nil
+	for _, p := range photos {
+		jpg, err := shrinkJPEG(p.Img)
+		if err != nil {
+			c.lastPhotos = nil
+			break
+		}
+		c.lastPhotos = append(c.lastPhotos, keptPhoto{p.Asset, p.Info, jpg})
+	}
 
 	pool := len(c.assets)
 	if res.Offline {
