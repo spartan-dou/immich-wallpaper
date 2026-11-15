@@ -78,7 +78,12 @@ func TestReplaceFileSync(t *testing.T) {
 func TestSystemContext(t *testing.T) {
 	cost, err := connectionCost()
 	if err != nil {
-		t.Fatal("coût de la connexion illisible :", err)
+		// Service absent sur certaines éditions (Windows Server des machines de CI) :
+		// l'appli considère alors la connexion comme non limitée.
+		t.Logf("coût de la connexion indisponible : %v", err)
+		if meteredConnection() {
+			t.Fatal("sans information, la connexion ne doit pas être considérée comme limitée")
+		}
 	}
 	t.Logf("batterie=%v plein écran=%v coût connexion=%#x limitée=%v", onBattery(), fullscreenBusy(), cost, meteredConnection())
 	cfg := defaultConfig()
