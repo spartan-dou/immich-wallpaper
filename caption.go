@@ -6,6 +6,7 @@ import (
 	"image/draw"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -34,9 +35,14 @@ func parseFirst(paths []string, fallback []byte) *opentype.Font {
 }
 
 func loadFonts() *Fonts {
+	win := os.Getenv("WINDIR")
+	if win == "" {
+		win = `C:\Windows`
+	}
+	dir := filepath.Join(win, "Fonts")
 	return &Fonts{
-		Title: parseFirst([]string{`C:\Windows\Fonts\seguisb.ttf`, `C:\Windows\Fonts\segoeui.ttf`}, gomedium.TTF),
-		Body:  parseFirst([]string{`C:\Windows\Fonts\segoeui.ttf`}, goregular.TTF),
+		Title: parseFirst([]string{filepath.Join(dir, "seguisb.ttf"), filepath.Join(dir, "segoeui.ttf")}, gomedium.TTF),
+		Body:  parseFirst([]string{filepath.Join(dir, "segoeui.ttf")}, goregular.TTF),
 	}
 }
 

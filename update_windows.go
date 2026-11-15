@@ -12,20 +12,44 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
+// writeFileSync écrit le fichier et attend qu'il soit réellement sur le disque.
+func writeFileSync(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
 // replaceSelf remplace l'exe en cours d'exécution. Windows interdit d'écraser un exe lancé,
-// mais autorise à le renommer : on le renomme en .old, on écrit le nouveau à sa place.
+// mais autorise à le renommer. Le nouvel exe est d'abord écrit entièrement dans un fichier
+// .new ; l'emplacement final ne change ensuite que par deux renommages (exe → .old,
+// .new → exe) : une coupure pendant l'écriture ne laisse jamais d'exécutable tronqué.
 func replaceSelf(bin []byte) (string, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	old := self + ".old"
-	os.Remove(old)
-	if err := os.Rename(self, old); err != nil {
+	old, tmp := self+".old", self+".new"
+	if err := writeFileSync(tmp, bin); err != nil {
+		os.Remove(tmp)
 		return "", err
 	}
-	if err := os.WriteFile(self, bin, 0o755); err != nil {
+	os.Remove(old)
+	if err := os.Rename(self, old); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	if err := os.Rename(tmp, self); err != nil {
 		os.Rename(old, self) // retour arrière
+		os.Remove(tmp)
 		return "", err
 	}
 	return self, nil
@@ -40,12 +64,15 @@ func cleanupAfterUpdate() {
 		return
 	}
 	os.Remove(self + ".bad")
+	os.Remove(self + ".new") // mise à jour interrompue avant le renommage
 	if !hasArg("--after-update") {
 		os.Remove(self + ".old")
 	}
 	if samePath(self, installedExe()) {
 		if k, err := registry.OpenKey(registry.CURRENT_USER, uninstallKey, registry.SET_VALUE); err == nil {
-			k.SetStringValue("DisplayVersion", appVersion)
+			if err := k.SetStringValue("DisplayVersion", appVersion); err != nil {
+				log.Printf("version affichée dans les applications installées : %v", err)
+			}
 			k.Close()
 		}
 	}
@@ -58,7 +85,9 @@ func skipFile() string   { return filepath.Join(dataDir(), "skip_version") }
 // qui peut alors se terminer ; on supprime ensuite l'ancien exe.
 func reportHealthy() {
 	time.Sleep(20 * time.Second)
-	os.WriteFile(healthFile(), []byte(appVersion), 0o644)
+	if err := os.WriteFile(healthFile(), []byte(appVersion), 0o644); err != nil {
+		log.Printf("signal de bonne santé : %v", err)
+	}
 	log.Printf("mise à jour vers %s validée", appVersion)
 	self, err := os.Executable()
 	if err != nil {
@@ -102,8 +131,12 @@ func (p *pendingUpdate) watch() {
 				log.Printf("retour arrière impossible")
 				return
 			}
-			os.WriteFile(skipFile(), []byte(p.version), 0o644)
-			hiddenCmd(p.self, "--after-update").Start()
+			if err := os.WriteFile(skipFile(), []byte(p.version), 0o644); err != nil {
+				log.Printf("mémorisation de la version à ignorer : %v", err)
+			}
+			if err := hiddenCmd(p.self, "--after-update").Start(); err != nil {
+				log.Printf("relance de l'ancienne version : %v", err)
+			}
 			return
 		case <-deadline:
 			return // toujours en vie sans signal : on la laisse tourner
@@ -125,6 +158,7 @@ func waitForInstance() bool {
 
 // checkAndUpdate cherche une nouvelle version ; manual = déclenché depuis le menu.
 func (a *App) checkAndUpdate(manual bool) {
+	defer recovered("mise à jour")
 	if !a.updating.CompareAndSwap(false, true) {
 		return
 	}

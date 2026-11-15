@@ -4,7 +4,6 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -35,6 +34,9 @@ type App struct {
 	next     time.Time
 	paused   bool
 	status   string
+	failures int           // échecs consécutifs (temporisation croissante)
+	hold     string        // pourquoi le changement automatique attend (batterie, plein écran…)
+	wake     chan struct{} // réveille la planification quand l'échéance change
 	busy     atomic.Bool
 	updating atomic.Bool
 	pending  *pendingUpdate
@@ -61,19 +63,20 @@ func main() {
 		msgBox("Immich Wallpaper", "L'application est déjà lancée (icône près de l'horloge).", mbIconInfo)
 		return
 	}
-	a := &App{dir: dataDir()}
-	os.MkdirAll(a.dir, 0o755)
-	writePID()
-	cleanupAfterUpdate()
+	a := &App{dir: dataDir(), wake: make(chan struct{}, 1)}
+	dirErr := os.MkdirAll(a.dir, 0o755)
 	a.cfgPath = filepath.Join(a.dir, "config.json")
 	a.logPath = filepath.Join(a.dir, "journal.txt")
-	if st, err := os.Stat(a.logPath); err == nil && st.Size() > 1<<20 {
-		os.Remove(a.logPath)
-	}
-	if f, err := os.OpenFile(a.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
-		log.SetOutput(io.MultiWriter(f))
+	// Journal borné à 1 Mo, l'ancien est gardé dans journal.1.txt.
+	if l, err := openRotatingLog(a.logPath, 1<<20); err == nil {
+		log.SetOutput(l)
 	}
 	log.Printf("--- démarrage v%s, dossier %s", appVersion, a.dir)
+	if dirErr != nil {
+		log.Printf("dossier de données : %v", dirErr)
+	}
+	writePID()
+	cleanupAfterUpdate()
 
 	a.core = newCore(a.dir, setWallpaper)
 	a.core.setLockScreen = setLockScreen
@@ -96,6 +99,8 @@ func main() {
 		return "Nouvelle image : " + as.OriginalFileName, nil
 	}
 	a.settings.Status = a.getStatus
+	a.settings.Excluded = a.core.ExcludedCount
+	a.settings.OnClearExcluded = a.core.ClearExcluded
 
 	systray.Run(a.onReady, func() { log.Printf("--- arrêt") })
 	if a.pending != nil {
@@ -119,6 +124,8 @@ func (a *App) getStatus() string {
 	s := a.status
 	if a.paused {
 		s += " · en pause"
+	} else if a.hold != "" {
+		s += " · en attente (" + a.hold + ")"
 	} else if !a.next.IsZero() && a.cfg != nil {
 		s += " · prochaine à " + a.next.Format("15:04")
 	}
@@ -143,18 +150,128 @@ func (a *App) applyConfig(cfg *Config, startup bool) {
 	} else {
 		a.next = time.Now() // nouvelle config → on applique tout de suite
 	}
+	a.failures = 0
 	a.mu.Unlock()
+	a.poke()
 	log.Printf("config chargée : %s, %d album(s), toutes les %d min", cfg.ServerURL, len(cfg.Albums), cfg.IntervalMinutes)
 }
 
-func (a *App) change() (Asset, error) {
+// poke demande à la planification de recalculer sa prochaine échéance.
+func (a *App) poke() {
+	select {
+	case a.wake <- struct{}{}:
+	default:
+	}
+}
+
+// retryDelay : délai avant un nouvel essai après n échecs consécutifs (2, 4, 8… 30 min).
+func retryDelay(n int) time.Duration {
+	d := 2 * time.Minute
+	for i := 1; i < n && d < 30*time.Minute; i++ {
+		d *= 2
+	}
+	return min(d, 30*time.Minute)
+}
+
+// recovered journalise un panic au lieu de laisser l'appli (sans console) disparaître.
+func recovered(what string) {
+	if r := recover(); r != nil {
+		log.Printf("panic (%s) : %v\n%s", what, r, debug.Stack())
+	}
+}
+
+// blocked indique pourquoi un changement automatique doit attendre ("" = rien ne s'y oppose).
+// hours=false ignore la plage horaire (préchargement).
+func blocked(cfg *Config, hours bool) string {
+	switch {
+	case hours && !cfg.activeAt(time.Now()):
+		return "hors plage horaire"
+	case cfg.PauseOnBattery && onBattery():
+		return "sur batterie"
+	case cfg.PauseOnFullscreen && fullscreenBusy():
+		return "application en plein écran"
+	case cfg.PauseOnMetered && meteredConnection():
+		return "connexion limitée"
+	}
+	return ""
+}
+
+// preload prépare la photo suivante en arrière-plan, sauf si le contexte s'y oppose.
+func (a *App) preload() {
+	defer recovered("préchargement")
+	a.mu.Lock()
+	cfg := a.cfg
+	a.mu.Unlock()
+	if cfg == nil || !cfg.Preload || blocked(cfg, false) != "" {
+		return
+	}
+	if err := a.core.Preload(); err != nil {
+		log.Printf("préchargement : %v", err)
+	}
+}
+
+// previous réaffiche le fond d'écran précédent et repousse le prochain changement.
+func (a *App) previous() {
+	defer recovered("photo précédente")
+	if !a.busy.CompareAndSwap(false, true) {
+		return
+	}
+	defer a.busy.Store(false)
+	res, err := a.core.Previous()
+	if err != nil {
+		if !errors.Is(err, errNoPrevious) {
+			log.Printf("photo précédente : %v", err)
+		}
+		a.setStatus("Photo précédente : " + err.Error())
+		return
+	}
+	a.mu.Lock()
+	if a.cfg != nil {
+		a.next = time.Now().Add(time.Duration(a.cfg.IntervalMinutes) * time.Minute)
+	}
+	a.mu.Unlock()
+	a.poke()
+	a.setStatus("Photo précédente : " + res.Asset.OriginalFileName)
+}
+
+// favorite ajoute la photo affichée aux favoris Immich.
+func (a *App) favorite() {
+	defer recovered("favori")
+	as, err := a.core.Favorite()
+	if err != nil {
+		log.Printf("ajout aux favoris : %v", err)
+		a.setStatus("Favori impossible : " + err.Error())
+		return
+	}
+	log.Printf("ajoutée aux favoris Immich : %s (%s)", as.OriginalFileName, as.ID)
+	a.setStatus("Ajoutée aux favoris Immich : " + as.OriginalFileName)
+}
+
+// hide masque définitivement la photo affichée (liste locale) et passe à la suivante.
+func (a *App) hide() {
+	defer recovered("photo masquée")
+	if _, err := a.core.ExcludeCurrent(); err != nil {
+		log.Printf("photo masquée : %v", err)
+		a.setStatus("Impossible de masquer la photo : " + err.Error())
+		return
+	}
+	a.change()
+}
+
+func (a *App) change() (as Asset, err error) {
 	if !a.busy.CompareAndSwap(false, true) {
 		return Asset{}, errors.New("un changement est déjà en cours")
 	}
 	defer a.busy.Store(false)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic (changement d'image) : %v\n%s", r, debug.Stack())
+			err = fmt.Errorf("erreur interne : %v", r)
+		}
+	}()
 	a.setStatus("Téléchargement…")
 	res, err := a.core.Next()
-	as := res.Asset
+	as = res.Asset
 
 	a.mu.Lock()
 	interval := 60 * time.Minute
@@ -163,13 +280,17 @@ func (a *App) change() (Asset, error) {
 	}
 	switch {
 	case err == nil:
+		a.failures = 0
+		a.hold = ""
 		a.next = time.Now().Add(interval)
-	case errors.Is(err, errUnauthorized):
+	case isAuthErr(err):
 		a.next = time.Now().Add(30 * time.Minute)
-	default: // réseau pas prêt (démarrage, VPN…) : on réessaie bientôt
-		a.next = time.Now().Add(2 * time.Minute)
+	default: // réseau pas prêt (démarrage, VPN…) : nouvel essai bientôt, puis de plus en plus espacé
+		a.failures++
+		a.next = time.Now().Add(retryDelay(a.failures))
 	}
 	a.mu.Unlock()
+	a.poke()
 
 	if err != nil {
 		log.Printf("erreur : %v", err)
@@ -179,7 +300,7 @@ func (a *App) change() (Asset, error) {
 	st := as.OriginalFileName
 	if res.Offline {
 		st = "Hors ligne (photo du cache) : " + st
-		if errors.Is(res.Cause, errUnauthorized) {
+		if isAuthErr(res.Cause) {
 			st = "Token refusé, photo du cache : " + as.OriginalFileName
 		}
 	}
@@ -188,6 +309,9 @@ func (a *App) change() (Asset, error) {
 	}
 	a.setStatus(st)
 	a.mOpenPic.Enable()
+	if !res.Offline {
+		go a.preload() // la photo suivante est prête avant le prochain changement
+	}
 	return as, nil
 }
 
@@ -199,8 +323,11 @@ func (a *App) onReady() {
 	a.mStatus.Disable()
 	systray.AddSeparator()
 	mNext := systray.AddMenuItem("Image suivante", "Changer le fond d'écran maintenant")
+	mPrev := systray.AddMenuItem("Photo précédente", "Revenir au fond d'écran précédent")
 	a.mOpenPic = systray.AddMenuItem("Voir la photo dans Immich", "")
 	a.mOpenPic.Disable()
+	mFav := systray.AddMenuItem("Ajouter aux favoris Immich", "Marquer la photo affichée comme favorite")
+	mHide := systray.AddMenuItem("Ne plus afficher cette photo", "La masquer (réversible dans les paramètres) et passer à la suivante")
 	systray.AddSeparator()
 	mSettings := systray.AddMenuItem("Paramètres…", "Ouvrir la page de réglages")
 	mPause := systray.AddMenuItemCheckbox("Pause", "Ne plus changer automatiquement", false)
@@ -219,7 +346,19 @@ func (a *App) onReady() {
 	})
 
 	if _, err := os.Stat(a.cfgPath); errors.Is(err, os.ErrNotExist) {
-		writeDefaultConfig(a.cfgPath)
+		if err := writeDefaultConfig(a.cfgPath); err != nil {
+			log.Printf("création de la configuration par défaut : %v", err)
+		}
+	}
+	if keyStoredPlain(a.cfgPath) {
+		// Clé API en clair (ancienne version, édition à la main) : on la réécrit chiffrée.
+		if cfg, err := readConfig(a.cfgPath); err == nil {
+			if err := saveConfig(a.cfgPath, cfg); err != nil {
+				log.Printf("chiffrement de la clé API : %v", err)
+			} else if !keyStoredPlain(a.cfgPath) {
+				log.Printf("clé API chiffrée dans config.json (DPAPI)")
+			}
+		}
 	}
 	if cfg, err := loadConfig(a.cfgPath); err == nil {
 		a.applyConfig(cfg, true)
@@ -237,22 +376,49 @@ func (a *App) onReady() {
 	go a.handleSystemEvents()
 
 	go func() {
-		t := time.NewTicker(10 * time.Second)
+		// Un minuteur réarmé sur la prochaine échéance, au lieu d'un réveil toutes les 10 s.
+		// Plafonné à 1 min : l'horloge des minuteurs peut ne pas avancer pendant la veille du PC,
+		// on recompare donc régulièrement à l'heure réelle.
+		t := time.NewTimer(time.Hour)
 		check := func() {
 			a.mu.Lock()
-			due := a.cfg != nil && !a.paused && !time.Now().Before(a.next)
+			cfg := a.cfg
+			active := cfg != nil && !a.paused
+			wait := time.Until(a.next)
 			a.mu.Unlock()
-			if due {
-				go a.change()
+			hold := ""
+			switch {
+			case !active:
+				wait = time.Minute
+			case wait <= 0:
+				// Échéance atteinte : on attend si le contexte s'y oppose (réévalué chaque minute).
+				if hold = blocked(cfg, true); hold != "" {
+					wait = time.Minute
+				} else {
+					go a.change()
+					wait = 10 * time.Second // change() réveille la boucle dès qu'il a fixé la suite
+				}
 			}
+			a.mu.Lock()
+			a.hold = hold
+			a.mu.Unlock()
+			t.Reset(min(wait, time.Minute))
 		}
 		check()
 		for {
 			select {
 			case <-t.C:
 				check()
+			case <-a.wake:
+				check()
 			case <-mNext.ClickedCh:
 				go a.change()
+			case <-mPrev.ClickedCh:
+				go a.previous()
+			case <-mFav.ClickedCh:
+				go a.favorite()
+			case <-mHide.ClickedCh:
+				go a.hide()
 			case <-a.mOpenPic.ClickedCh:
 				if _, u, ok := a.core.Last(); ok {
 					shellOpen(u)
@@ -264,6 +430,7 @@ func (a *App) onReady() {
 				a.paused = !a.paused
 				p := a.paused
 				a.mu.Unlock()
+				a.poke()
 				if p {
 					mPause.Check()
 				} else {
@@ -283,7 +450,9 @@ func (a *App) onReady() {
 			case <-mUninstall.ClickedCh:
 				// Lancé dans un processus séparé : il nous arrête puis supprime nos fichiers.
 				if self, err := os.Executable(); err == nil {
-					hiddenCmd(self, "--uninstall").Start()
+					if err := hiddenCmd(self, "--uninstall").Start(); err != nil {
+						log.Printf("lancement de la désinstallation : %v", err)
+					}
 				}
 			case <-mLog.ClickedCh:
 				shellOpen(a.logPath)
@@ -339,23 +508,40 @@ func (a *App) handleSystemEvents() {
 			if cfg == nil {
 				continue
 			}
-			if ev == evUnlock && cfg.ChangeOnUnlock && !paused {
+			if ev == evUnlock && cfg.ChangeOnUnlock && !paused && blocked(cfg, true) == "" {
 				log.Printf("session déverrouillée : nouvelle image")
 				go a.change()
 			} else {
 				go a.reapply()
 			}
+			a.poke() // sortie de veille possible : l'échéance est peut-être dépassée
 		}
 	}
 }
 
 // reapply recalcule le fond d'écran (mêmes photos) pour la nouvelle configuration d'écrans.
+// S'il faut plus de photos que celles mémorisées (écran ajouté, aucune photo encore affichée),
+// un nouveau tirage passe par change() — statut et échéance à jour — sauf si l'appli est en pause.
 func (a *App) reapply() {
+	defer recovered("recalcul après changement d'écran")
 	if !a.busy.CompareAndSwap(false, true) {
 		return
 	}
-	defer a.busy.Store(false)
-	if _, err := a.core.Reapply(); err != nil {
+	_, err := a.core.Reapply()
+	a.busy.Store(false)
+	switch {
+	case err == nil:
+	case errors.Is(err, errNeedDraw):
+		a.mu.Lock()
+		paused := a.paused
+		a.mu.Unlock()
+		if paused {
+			log.Printf("écrans modifiés : nouveau tirage nécessaire, ignoré (en pause)")
+			return
+		}
+		log.Printf("écrans modifiés : nouveau tirage nécessaire")
+		a.change()
+	default:
 		log.Printf("recalcul après changement d'écran : %v", err)
 	}
 }

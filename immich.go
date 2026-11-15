@@ -2,7 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,10 +14,26 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 )
 
-var errUnauthorized = errors.New("token refusé par Immich (401/403) : vérifie api_key et ses permissions")
+var (
+	// 401 : la clé elle-même est refusée (erreur globale).
+	errUnauthorized = errors.New("token refusé par Immich (401) : vérifie api_key")
+	// 403 : la clé est valide mais n'a pas le droit d'accéder à cette ressource.
+	errForbidden = errors.New("accès refusé par Immich (403) : vérifie les permissions du token")
+)
+
+func isAuthErr(err error) bool {
+	return errors.Is(err, errUnauthorized) || errors.Is(err, errForbidden)
+}
+
+const (
+	apiTimeout      = 2 * time.Minute  // requêtes JSON, et attente des en-têtes de réponse
+	downloadTimeout = 15 * time.Minute // téléchargement d'une image, corps compris
+)
 
 type Asset struct {
 	ID               string `json:"id"`
@@ -23,31 +43,93 @@ type Asset struct {
 }
 
 type Client struct {
-	base string
-	key  string
-	http *http.Client
+	base   string
+	key    string
+	http   *http.Client
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	pinMu sync.Mutex
+	pin   string // empreinte SHA-256 (hex) du certificat accepté, si insecure_skip_verify
 }
 
 func newClient(cfg *Config) *Client {
+	c := &Client{base: cfg.ServerURL, key: cfg.APIKey, pin: normalizeFingerprint(cfg.CertFingerprint)}
+	c.ctx, c.cancel = context.WithCancel(context.Background())
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = apiTimeout
 	if cfg.InsecureSkipVerify {
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		// Certificat auto-signé : la chaîne n'est pas vérifiée, mais le certificat est épinglé.
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true, VerifyPeerCertificate: c.verifyPin}
 	}
-	return &Client{
-		base: cfg.ServerURL,
-		key:  cfg.APIKey,
-		http: &http.Client{Timeout: 2 * time.Minute, Transport: tr},
-	}
+	c.http = &http.Client{Transport: tr}
+	return c
 }
 
-func (c *Client) do(method, path string, body any) (*http.Response, error) {
+// Close annule les requêtes en cours (changement de configuration, arrêt).
+func (c *Client) Close() {
+	c.cancel()
+	c.http.CloseIdleConnections()
+}
+
+func normalizeFingerprint(s string) string {
+	return strings.ToLower(strings.NewReplacer(":", "", " ", "").Replace(strings.TrimSpace(s)))
+}
+
+// verifyPin n'accepte que le certificat épinglé. Sans empreinte connue, le premier certificat
+// présenté est adopté (confiance au premier contact) et exigé pour toutes les connexions suivantes.
+func (c *Client) verifyPin(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	if len(rawCerts) == 0 {
+		return errors.New("le serveur n'a présenté aucun certificat")
+	}
+	sum := sha256.Sum256(rawCerts[0])
+	got := hex.EncodeToString(sum[:])
+	c.pinMu.Lock()
+	defer c.pinMu.Unlock()
+	if c.pin == "" {
+		c.pin = got
+		log.Printf("certificat non vérifié accepté et épinglé (SHA-256 %s)", got)
+		return nil
+	}
+	if got != c.pin {
+		return fmt.Errorf("le certificat du serveur a changé (empreinte %s… au lieu de %s…) : "+
+			"reteste la connexion dans les paramètres puis enregistre si ce changement est attendu", got[:16], c.pin[:min(16, len(c.pin))])
+	}
+	return nil
+}
+
+// Fingerprint renvoie l'empreinte du certificat épinglé ("" si aucun).
+func (c *Client) Fingerprint() string {
+	c.pinMu.Lock()
+	defer c.pinMu.Unlock()
+	return c.pin
+}
+
+// cancelBody libère le contexte de la requête à la fermeture du corps.
+type cancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
+
+func (c *Client) do(method, path string, body any, timeout time.Duration) (*http.Response, error) {
 	var rd io.Reader
 	if body != nil {
-		b, _ := json.Marshal(body)
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
 		rd = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, c.base+path, rd)
+	ctx, cancel := context.WithTimeout(c.ctx, timeout)
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rd)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	req.Header.Set("x-api-key", c.key)
@@ -56,17 +138,23 @@ func (c *Client) do(method, path string, body any) (*http.Response, error) {
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+	resp.Body = cancelBody{resp.Body, cancel}
+	switch resp.StatusCode {
+	case 401:
 		resp.Body.Close()
 		return nil, errUnauthorized
+	case 403:
+		resp.Body.Close()
+		return nil, errForbidden
 	}
 	return resp, nil
 }
 
 func (c *Client) getJSON(method, path string, body, out any) error {
-	resp, err := c.do(method, path, body)
+	resp, err := c.do(method, path, body, apiTimeout)
 	if err != nil {
 		return err
 	}
@@ -98,7 +186,8 @@ func (c *Client) AlbumImages(albumID string) (name string, imgs []Asset, err err
 		}
 	}
 	for _, a := range all {
-		if a.Type == "IMAGE" && !a.IsTrashed {
+		// L'identifiant sert de nom de fichier (cache) et dans des URL : UUID strict uniquement.
+		if a.Type == "IMAGE" && !a.IsTrashed && isUUID(a.ID) {
 			imgs = append(imgs, a)
 		}
 	}
@@ -132,11 +221,11 @@ func (c *Client) Download(assetID, size string) ([]byte, error) {
 	if size == "original" {
 		path = "/api/assets/" + url.PathEscape(assetID) + "/original"
 	}
-	resp, err := c.do("GET", path, nil)
+	resp, err := c.do("GET", path, nil, downloadTimeout)
 	if err != nil {
 		// « fullsize » peut rediriger vers l'original, qui exige asset.download :
 		// sans cette permission, on se rabat sur l'aperçu plutôt que d'échouer.
-		if size == "fullsize" && errors.Is(err, errUnauthorized) {
+		if size == "fullsize" && errors.Is(err, errForbidden) {
 			log.Printf("fullsize refusé (permission asset.download absente ?), utilisation de l'aperçu")
 			return c.Download(assetID, "preview")
 		}
@@ -166,6 +255,16 @@ func (c *Client) AssetInfo(id string) (AssetInfo, error) {
 	var info AssetInfo
 	err := c.getJSON("GET", "/api/assets/"+url.PathEscape(id), nil, &info)
 	return info, err
+}
+
+// SetFavorite ajoute la photo aux favoris Immich (permission asset.update).
+func (c *Client) SetFavorite(id string) error {
+	var out struct{}
+	err := c.getJSON("PUT", "/api/assets/"+url.PathEscape(id), map[string]any{"isFavorite": true}, &out)
+	if errors.Is(err, errForbidden) {
+		return errors.New("permission asset.update absente sur la clé API (Immich → Clés API)")
+	}
+	return err
 }
 
 type AlbumInfo struct {

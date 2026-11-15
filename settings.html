@@ -25,7 +25,7 @@
   label { display: block; font-weight: 500; margin: 12px 0 4px; }
   label:first-of-type { margin-top: 0; }
   .hint { color: var(--muted); font-size: 13px; margin-top: 4px; }
-  input[type=text], input[type=password], input[type=number], select {
+  input[type=text], input[type=password], input[type=number], input[type=time], select {
     width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
     background: var(--field); color: var(--fg); font: inherit; }
   input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
@@ -46,7 +46,11 @@
   .msg.ok { color: var(--ok); } .msg.err { color: var(--err); }
   #status { color: var(--muted); font-size: 14px; }
   footer { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; }
-  @media (max-width: 600px) { .row { grid-template-columns: 1fr; } }
+  .rule { border: 1px solid var(--line); border-radius: 6px; padding: 12px; margin-top: 10px; }
+  .rule .row { grid-template-columns: 1.4fr 1fr 1fr auto; align-items: end; }
+  .rule summary { cursor: pointer; margin-top: 10px; }
+  .rule .list { max-height: 200px; overflow: auto; margin-top: 6px; }
+  @media (max-width: 600px) { .row, .rule .row { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -60,8 +64,10 @@
     <input type="text" id="server_url" placeholder="https://immich.exemple.fr" autocomplete="off">
     <label for="api_key">Token (clé API)</label>
     <input type="password" id="api_key" autocomplete="off">
-    <div class="hint" id="key_hint">Immich → Paramètres du compte → Clés API. Permissions : album.read, asset.read, asset.view, asset.download.</div>
+    <div class="hint" id="key_hint">Immich → Paramètres du compte → Clés API. Permissions : album.read, asset.read, asset.view, asset.download (et asset.update pour « Ajouter aux favoris »).</div>
+    <div class="hint msg err" id="http_warn" hidden>Connexion non chiffrée (http://) vers un serveur hors réseau local : le token et les photos circulent en clair. Préfère https://.</div>
     <label class="check"><input type="checkbox" id="insecure_skip_verify"> Accepter un certificat auto-signé</label>
+    <div class="hint" id="pin_hint">Le certificat présenté lors du test est mémorisé (empreinte SHA-256) : seul ce certificat sera accepté ensuite. S'il est renouvelé, reteste la connexion puis enregistre.</div>
     <div class="bar" style="margin-top:14px">
       <button id="test">Tester et charger les albums</button>
       <span class="msg" id="test_msg"></span>
@@ -120,6 +126,36 @@
     <label class="check" style="margin-top:16px"><input type="checkbox" id="landscape_only"> Uniquement les photos en paysage</label>
     <label class="check"><input type="checkbox" id="change_on_start"> Changer d'image au démarrage</label>
     <label class="check"><input type="checkbox" id="change_on_unlock"> Changer d'image à chaque déverrouillage du PC</label>
+    <div class="bar" style="margin-top:16px">
+      <span id="excluded_info" class="hint" style="margin:0"></span>
+      <button id="clear_excluded" hidden>Les réafficher</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Planification</h2>
+    <div class="row" style="grid-template-columns: 1fr 1fr">
+      <div>
+        <label for="active_from">Changer d'image à partir de</label>
+        <input type="time" id="active_from">
+      </div>
+      <div>
+        <label for="active_to">et jusqu'à</label>
+        <input type="time" id="active_to">
+      </div>
+    </div>
+    <div class="hint">Laisse les deux vides pour changer toute la journée. Une plage comme 22:00 → 07:00 passe par minuit.</div>
+    <label class="check" style="margin-top:16px"><input type="checkbox" id="pause_on_battery"> Ne pas changer sur batterie</label>
+    <label class="check"><input type="checkbox" id="pause_on_metered"> Ne pas changer sur une connexion limitée (partage de connexion, forfait de données)</label>
+    <label class="check"><input type="checkbox" id="pause_on_fullscreen"> Ne pas changer pendant une application en plein écran (jeu, vidéo, présentation)</label>
+    <div class="hint">Ces réglages ne concernent que les changements automatiques : « Image suivante » fonctionne toujours. Le changement se fait dès que la condition disparaît.</div>
+    <label class="check" style="margin-top:16px"><input type="checkbox" id="preload"> Télécharger la photo suivante à l'avance</label>
+    <div class="hint">Le changement suivant est alors immédiat et ne dépend plus du réseau (utile au déverrouillage du PC).</div>
+
+    <h2 style="margin-top:22px">Albums selon la saison ou l'heure</h2>
+    <div class="hint" style="margin-top:0">Quand une règle s'applique, ses albums remplacent ceux cochés plus haut (plusieurs règles en même temps : leurs albums sont réunis). Sinon, les albums habituels sont utilisés.</div>
+    <div id="rules"></div>
+    <div class="bar" style="margin-top:12px"><button id="add_rule">Ajouter une règle</button></div>
   </section>
 
   <section>
@@ -146,7 +182,7 @@
   <section>
     <h2>Mises à jour</h2>
     <label class="check" style="margin-top:0"><input type="checkbox" id="auto_update"> Installer automatiquement les nouvelles versions publiées sur GitHub</label>
-    <div class="hint">Vérification au démarrage puis une fois par jour. Fichier vérifié par empreinte SHA256 avant installation.</div>
+    <div class="hint">Vérification au démarrage puis une fois par jour. Téléchargement depuis les releases GitHub du projet uniquement ; l'empreinte SHA256 détecte un fichier corrompu (les releases ne sont pas signées).</div>
   </section>
 
   <footer class="bar">
@@ -157,7 +193,7 @@
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let selected = new Set(), albums = [];
+let selected = new Set(), albums = [], rules = [];
 
 async function api(path, body) {
   const r = await fetch(path, body === undefined ? {} :
@@ -181,8 +217,26 @@ function form() {
     desktop_link: $('desktop_link').checked, auto_update: $('auto_update').checked,
     multi_monitor: $('multi_monitor').value, split_wide: $('split_wide').checked,
     change_on_unlock: $('change_on_unlock').checked,
+    active_from: $('active_from').value, active_to: $('active_to').value,
+    pause_on_battery: $('pause_on_battery').checked, pause_on_metered: $('pause_on_metered').checked,
+    pause_on_fullscreen: $('pause_on_fullscreen').checked, preload: $('preload').checked,
+    album_rules: rules.filter(r => r.albums.length),
     offline_cache: Math.max(0, parseInt($('offline_cache').value, 10) || 0),
   };
+}
+
+// Avertit si l'adresse est en http:// vers autre chose qu'une machine du réseau local.
+function checkURL() {
+  let warn = false;
+  try {
+    const u = new URL($('server_url').value.trim());
+    const h = u.hostname;
+    const local = h === 'localhost' || h.endsWith('.local') || h.endsWith('.lan') || h.endsWith('.home') || !h.includes('.') ||
+      /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(h) ||
+      /^\[(::1|f[cd]|fe80)/i.test(h);
+    warn = u.protocol === 'http:' && !local;
+  } catch (e) {}
+  $('http_warn').hidden = !warn;
 }
 
 function render() {
@@ -203,6 +257,56 @@ function render() {
     l.append(c, n, k); box.append(l);
   }
   count();
+  renderRules();
+}
+
+// Albums connus (liste chargée) complétés par les identifiants donnés, absents de la liste.
+function albumList(ids) {
+  const known = new Set(albums.map(a => a.id));
+  return albums.concat(ids.filter(id => !known.has(id))
+    .map(id => ({ id, albumName: '(album ' + id.slice(0, 8) + '…)' })));
+}
+function field(text, input) {
+  const d = document.createElement('div'), l = document.createElement('label');
+  l.textContent = text; d.append(l, input); return d;
+}
+function renderRules() {
+  const box = $('rules'); box.innerHTML = '';
+  rules.forEach((r, i) => {
+    const el = document.createElement('div'); el.className = 'rule';
+    const row = document.createElement('div'); row.className = 'row';
+    const season = document.createElement('select');
+    for (const [v, t] of [['', 'Toute l\'année'], ['spring', 'Printemps (mars-mai)'], ['summer', 'Été (juin-août)'],
+                          ['autumn', 'Automne (sept.-nov.)'], ['winter', 'Hiver (déc.-fév.)']]) {
+      const o = document.createElement('option'); o.value = v; o.textContent = t; season.append(o);
+    }
+    season.value = r.season || ''; season.onchange = () => { r.season = season.value; };
+    const from = document.createElement('input'); from.type = 'time'; from.value = r.from || '';
+    from.onchange = () => { r.from = from.value; };
+    const to = document.createElement('input'); to.type = 'time'; to.value = r.to || '';
+    to.onchange = () => { r.to = to.value; };
+    const del = document.createElement('button'); del.textContent = 'Supprimer';
+    del.onclick = () => { rules.splice(i, 1); renderRules(); };
+    row.append(field('Saison', season), field('De', from), field('À', to), del);
+    const det = document.createElement('details'), sum = document.createElement('summary');
+    const label = () => { sum.textContent = r.albums.length ? r.albums.length + ' album(s) pour cette règle' : 'Choisir les albums de cette règle'; };
+    label(); det.open = !r.albums.length;
+    const list = document.createElement('div'); list.className = 'list';
+    const all = albumList(r.albums);
+    if (!all.length) { list.innerHTML = '<div class="empty">Teste la connexion pour afficher tes albums.</div>'; }
+    for (const a of all) {
+      const l = document.createElement('label'); l.className = 'album';
+      const c = document.createElement('input'); c.type = 'checkbox'; c.checked = r.albums.includes(a.id);
+      c.onchange = () => { r.albums = c.checked ? r.albums.concat(a.id) : r.albums.filter(x => x !== a.id); label(); };
+      const n = document.createElement('span'); n.textContent = a.albumName;
+      l.append(c, n); list.append(l);
+    }
+    det.append(sum, list); el.append(row, det); box.append(el);
+  });
+}
+function showExcluded(n) {
+  $('excluded_info').textContent = n ? n + ' photo(s) masquée(s) depuis le menu « Ne plus afficher cette photo ».' : '';
+  $('clear_excluded').hidden = !n;
 }
 function count() {
   $('sel_count').textContent = selected.size ? selected.size + ' album(s) sélectionné(s)' : 'Aucun album sélectionné.';
@@ -211,6 +315,8 @@ function count() {
 async function load() {
   const c = await api('api/config');
   $('server_url').value = c.server_url || '';
+  checkURL();
+  if (c.cert_fingerprint) $('pin_hint').textContent += ' Empreinte actuelle : ' + c.cert_fingerprint.slice(0, 16) + '…';
   $('api_key').placeholder = c.has_key ? '•••••••• (enregistré — laisser vide pour le garder)' : 'Colle ta clé API ici';
   $('insecure_skip_verify').checked = !!c.insecure_skip_verify;
   $('interval_minutes').value = c.interval_minutes || 60;
@@ -228,6 +334,14 @@ async function load() {
   $('split_wide').checked = c.split_wide !== false;
   $('change_on_unlock').checked = c.change_on_unlock !== false;
   $('offline_cache').value = c.offline_cache ?? 40;
+  $('active_from').value = c.active_from || '';
+  $('active_to').value = c.active_to || '';
+  $('pause_on_battery').checked = !!c.pause_on_battery;
+  $('pause_on_metered').checked = !!c.pause_on_metered;
+  $('pause_on_fullscreen').checked = !!c.pause_on_fullscreen;
+  $('preload').checked = c.preload !== false;
+  rules = (c.album_rules || []).map(r => ({ albums: r.albums || [], season: r.season || '', from: r.from || '', to: r.to || '' }));
+  showExcluded(c.excluded_count || 0);
   selected = new Set(c.albums || []);
   render();
   if (c.has_key && c.server_url) testConn(true);
@@ -251,6 +365,12 @@ async function refreshStatus() {
 
 $('test').onclick = () => testConn(false);
 $('filter').oninput = render;
+$('server_url').oninput = checkURL;
+$('add_rule').onclick = () => { rules.push({ albums: [], season: '', from: '', to: '' }); renderRules(); };
+$('clear_excluded').onclick = async () => {
+  try { await api('api/clear-excluded', {}); showExcluded(0); }
+  catch (e) { msg($('save_msg'), e.message, false); }
+};
 $('save').onclick = async () => {
   const b = $('save'); b.disabled = true;
   try { await api('api/save', form()); msg($('save_msg'), 'Enregistré ✓', true); $('api_key').value = '';

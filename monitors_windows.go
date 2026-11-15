@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"runtime"
 	"sort"
 	"syscall"
@@ -91,7 +92,7 @@ func workAreaInset(rc rect32) int {
 func listMonitors() []Monitor {
 	var mons []Monitor
 	var primaryID string
-	withDesktopWallpaper(func(d desktopWallpaper) error {
+	err := withDesktopWallpaper(func(d desktopWallpaper) error {
 		var n uint32
 		if err := d.call(dwGetMonitorDeviceCount, uintptr(unsafe.Pointer(&n))); err != nil {
 			return err
@@ -133,6 +134,9 @@ func listMonitors() []Monitor {
 		}
 		return nil
 	})
+	if err != nil {
+		log.Printf("énumération des écrans : %v", err)
+	}
 	return mons
 }
 
@@ -146,7 +150,9 @@ func setMonitorWallpapers(paths map[string]string, style string) error {
 		if !ok {
 			pos = 4
 		}
-		d.call(dwSetPosition, pos)
+		if err := d.call(dwSetPosition, pos); err != nil {
+			log.Printf("ajustement du fond d'écran (SetPosition) : %v", err)
+		}
 		for id, path := range paths {
 			ip, _ := windows.UTF16PtrFromString(id)
 			pp, _ := windows.UTF16PtrFromString(path)
