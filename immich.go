@@ -257,6 +257,16 @@ func (c *Client) AssetInfo(id string) (AssetInfo, error) {
 	return info, err
 }
 
+// SetFavorite ajoute la photo aux favoris Immich (permission asset.update).
+func (c *Client) SetFavorite(id string) error {
+	var out struct{}
+	err := c.getJSON("PUT", "/api/assets/"+url.PathEscape(id), map[string]any{"isFavorite": true}, &out)
+	if errors.Is(err, errForbidden) {
+		return errors.New("permission asset.update absente sur la clé API (Immich → Clés API)")
+	}
+	return err
+}
+
 type AlbumInfo struct {
 	ID                         string `json:"id"`
 	AlbumName                  string `json:"albumName"`

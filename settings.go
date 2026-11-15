@@ -27,9 +27,11 @@ type SettingsServer struct {
 	// (option « certificat auto-signé ») : c'est elle qui est épinglée à l'enregistrement.
 	seenPins map[string]string
 
-	OnSaved func(*Config)
-	OnNext  func() (string, error)
-	Status  func() string
+	OnSaved         func(*Config)
+	OnNext          func() (string, error)
+	Status          func() string
+	Excluded        func() int   // nombre de photos masquées
+	OnClearExcluded func() error // les réautorise toutes
 }
 
 func startSettingsServer(cfgPath string) (*SettingsServer, error) {
@@ -63,7 +65,8 @@ func (s *SettingsServer) URL() string { return "http://" + s.addr + "/" + s.toke
 
 type uiConfig struct {
 	Config
-	HasKey bool `json:"has_key"`
+	HasKey        bool `json:"has_key"`
+	ExcludedCount int  `json:"excluded_count"`
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -105,7 +108,7 @@ func (s *SettingsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "méthode refusée", http.StatusMethodNotAllowed)
 			return
 		}
-	case "api/albums", "api/save", "api/next":
+	case "api/albums", "api/save", "api/next", "api/clear-excluded":
 		// Routes d'action : POST JSON de la page elle-même uniquement.
 		if r.Method != http.MethodPost {
 			http.Error(w, "méthode refusée", http.StatusMethodNotAllowed)
@@ -135,7 +138,11 @@ func (s *SettingsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		hasKey := cfg.APIKey != ""
 		cfg.APIKey = "" // le token n'est jamais renvoyé à la page
-		writeJSON(w, 200, uiConfig{cfg, hasKey})
+		excluded := 0
+		if s.Excluded != nil {
+			excluded = s.Excluded()
+		}
+		writeJSON(w, 200, uiConfig{cfg, hasKey, excluded})
 	case "api/albums":
 		var in Config
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -214,6 +221,14 @@ func (s *SettingsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, 200, map[string]string{"ok": msg})
+	case "api/clear-excluded":
+		if s.OnClearExcluded != nil {
+			if err := s.OnClearExcluded(); err != nil {
+				writeErr(w, err)
+				return
+			}
+		}
+		writeJSON(w, 200, map[string]string{"ok": "photos réaffichées"})
 	case "api/status":
 		st := ""
 		if s.Status != nil {

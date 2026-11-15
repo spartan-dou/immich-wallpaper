@@ -34,6 +34,11 @@ const keptMaxSide = 3840
 // errNeedDraw : Reapply ne peut pas couvrir les écrans actuels avec les photos mémorisées.
 var errNeedDraw = errors.New("pas assez de photos mémorisées pour les écrans actuels")
 
+var errNoPrevious = errors.New("aucune photo précédente en mémoire")
+
+// Nombre de fonds d'écran précédents gardés pour « Photo précédente ».
+const historyDepth = 5
+
 // Monitor est un écran cible (mode « une image par écran »). ID = chemin de périphérique Windows.
 type Monitor struct {
 	ID string
@@ -83,9 +88,15 @@ type Core struct {
 	last          Asset
 	lastOK        bool
 	lockErr       error
-	lastPhotos    []keptPhoto // photos affichées (compressées), réutilisées si les écrans changent
+	lastPhotos    []keptPhoto     // photos affichées (compressées), réutilisées si les écrans changent
+	history       [][]keptPhoto   // fonds d'écran précédents, du plus ancien au plus récent
+	excluded      map[string]bool // photos que l'utilisateur ne veut plus voir
+	preloaded     []preItem       // photos du prochain changement, déjà téléchargées (sur disque)
+	preGen        int             // configuration pour laquelle elles ont été préparées
+	preKey        string          // albums pour lesquels elles ont été préparées
 
 	dir string
+	now func() time.Time // horloge (remplaçable dans les tests) : règles d'albums par heure/saison
 
 	// Fonctions fournies par la plateforme (Windows) ; remplacées par des faux dans les tests.
 	setWallpaper         func(path, style string) error
@@ -101,8 +112,19 @@ func newCore(dir string, setWallpaper func(path, style string) error) *Core {
 		dir:          dir,
 		setWallpaper: setWallpaper,
 		albums:       map[string]*albumState{},
+		excluded:     map[string]bool{},
+		now:          time.Now,
 		rnd:          rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
+	if b, err := os.ReadFile(c.excludedPath()); err == nil {
+		var ids []string
+		if json.Unmarshal(b, &ids) == nil {
+			for _, id := range ids {
+				c.excluded[id] = true
+			}
+		}
+	}
+	os.RemoveAll(c.preloadDir()) // préchargement d'un lancement précédent : périmé
 	// Historique des photos récentes : conservé d'un lancement à l'autre.
 	if b, err := os.ReadFile(c.recentPath()); err == nil {
 		var ids []string
@@ -113,7 +135,9 @@ func newCore(dir string, setWallpaper func(path, style string) error) *Core {
 	return c
 }
 
-func (c *Core) recentPath() string { return filepath.Join(c.dir, "recent.json") }
+func (c *Core) recentPath() string   { return filepath.Join(c.dir, "recent.json") }
+func (c *Core) excludedPath() string { return filepath.Join(c.dir, "excluded.json") }
+func (c *Core) preloadDir() string   { return filepath.Join(c.dir, "preload") }
 
 func (c *Core) SetConfig(cfg *Config) {
 	c.mu.Lock()
@@ -124,6 +148,7 @@ func (c *Core) SetConfig(cfg *Config) {
 	c.cfg = cfg
 	c.client = newClient(cfg)
 	c.gen++
+	c.preloaded = nil
 	c.assets = nil
 	c.albumsChecked = time.Time{}
 	c.mu.Unlock()
@@ -173,26 +198,25 @@ func (c *Core) begin() (*job, error) {
 func (j *job) refreshAlbums() ([]Asset, error) {
 	c := j.c
 	c.mu.Lock()
-	assets, checked := c.assets, c.albumsChecked
+	loaded, checked := c.assets != nil, c.albumsChecked
 	albums := make(map[string]*albumState, len(c.albums))
 	for id, st := range c.albums {
 		albums[id] = st
 	}
 	c.mu.Unlock()
 
-	if assets != nil && time.Since(checked) < albumCheckEvery {
-		return assets, nil
+	if loaded && time.Since(checked) < albumCheckEvery {
+		return j.pick(albums)
 	}
 	sigs, err := j.client.AlbumSignatures()
 	if err != nil {
-		if isAuthErr(err) || assets == nil {
+		if isAuthErr(err) || !loaded {
 			return nil, err
 		}
 		log.Printf("vérification des albums impossible, liste précédente conservée : %v", err)
-		return assets, nil
+		return j.pick(albums)
 	}
-	changed := assets == nil
-	for _, id := range j.cfg.Albums {
+	for _, id := range j.cfg.allAlbums() {
 		sig, known := sigs[id]
 		if st := albums[id]; st != nil && known && st.sig == sig {
 			continue
@@ -206,7 +230,6 @@ func (j *job) refreshAlbums() ([]Asset, error) {
 				// Ni listé ni lisible : album supprimé ou partage retiré.
 				log.Printf("album %s inaccessible (%v) : retiré du tirage", id, err)
 				delete(albums, id)
-				changed = true
 			} else {
 				log.Printf("album %s : %v", id, err)
 			}
@@ -214,38 +237,52 @@ func (j *job) refreshAlbums() ([]Asset, error) {
 		}
 		log.Printf("album %q : %d images (rechargé)", name, len(imgs))
 		albums[id] = &albumState{sig: sig, name: name, assets: imgs}
-		changed = true
 	}
-	all := assets
-	if changed {
-		all = nil
-		seen := map[string]bool{}
-		for _, id := range j.cfg.Albums {
-			if st := albums[id]; st != nil {
-				for _, a := range st.assets {
-					if !seen[a.ID] {
-						seen[a.ID] = true
-						all = append(all, a)
-					}
-				}
-			}
-		}
-	}
+	all := mergeAlbums(albums, j.cfg.allAlbums())
 
 	c.mu.Lock()
 	if c.gen == j.gen { // sinon la configuration a changé entre-temps : résultat non mémorisé
 		c.albums, c.albumsChecked, c.assets = albums, time.Now(), all
 	}
 	c.mu.Unlock()
-	if len(all) == 0 {
-		return nil, errors.New("aucune image trouvée dans les albums configurés")
-	}
-	return all, nil
+	return j.pick(albums)
 }
+
+// mergeAlbums réunit sans doublon les images des albums demandés.
+func mergeAlbums(albums map[string]*albumState, ids []string) []Asset {
+	seen := map[string]bool{}
+	var all []Asset
+	for _, id := range ids {
+		if st := albums[id]; st != nil {
+			for _, a := range st.assets {
+				if !seen[a.ID] {
+					seen[a.ID] = true
+					all = append(all, a)
+				}
+			}
+		}
+	}
+	return all
+}
+
+// pick renvoie les images des albums à utiliser maintenant : ceux des règles (saison, heure)
+// qui s'appliquent ; à défaut, ou s'ils sont vides, les albums habituels.
+func (j *job) pick(albums map[string]*albumState) ([]Asset, error) {
+	for _, ids := range [][]string{j.cfg.albumsAt(j.c.now()), j.cfg.Albums, j.cfg.allAlbums()} {
+		if list := mergeAlbums(albums, ids); len(list) > 0 {
+			return list, nil
+		}
+	}
+	return nil, errors.New("aucune image trouvée dans les albums configurés")
+}
+
+// albumKey identifie les albums utilisés à cet instant (validité du préchargement).
+func (j *job) albumKey() string { return strings.Join(j.cfg.albumsAt(j.c.now()), ",") }
 
 // ---------- choix ----------
 
-// order mélange les assets en repoussant à la fin ceux affichés récemment.
+// order mélange les assets en repoussant à la fin ceux affichés récemment,
+// et écarte ceux que l'utilisateur ne veut plus voir.
 func (c *Core) order(list []Asset) []Asset {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -255,6 +292,9 @@ func (c *Core) order(list []Asset) []Asset {
 	}
 	var fresh, old []Asset
 	for _, a := range list {
+		if c.excluded[a.ID] {
+			continue
+		}
 		if recent[a.ID] {
 			old = append(old, a)
 		} else {
@@ -287,37 +327,24 @@ func safeDecode(decode func() (image.Image, error)) (img image.Image, err error)
 	return decode()
 }
 
-// online renvoie une source de photos téléchargées depuis Immich, une par appel.
-// Seule la photo demandée est décodée : les portraits écartés (landscape_only) ne sont ni
-// décodés ni mis en cache ; au plus n sont gardés compressés, en secours s'il manque des paysages.
-func (j *job) online(n int, assets []Asset) func() (Photo, error) {
-	type raw struct {
-		asset Asset
-		data  []byte
-		meta  imageMeta
-	}
+// rawPhoto : image téléchargée, vérifiée par son en-tête mais pas encore décodée.
+type rawPhoto struct {
+	asset   Asset
+	data    []byte
+	meta    imageMeta
+	info    AssetInfo
+	hasInfo bool
+}
+
+// rawSource renvoie une source d'images téléchargées depuis Immich, une par appel.
+// Rien n'est décodé ici : les portraits écartés (landscape_only) ne sont ni décodés ni mis
+// en cache ; au plus n sont gardés compressés, en secours s'il manque des paysages.
+func (j *job) rawSource(n int, assets []Asset) func() (rawPhoto, error) {
 	order := j.c.order(assets)
-	var portraits []raw
+	var portraits []rawPhoto
 	var lastErr error
 	i, tries := 0, 0
-
-	build := func(r raw) (Photo, error) {
-		img, err := safeDecode(func() (image.Image, error) { return r.meta.decode(r.data) })
-		if err != nil {
-			return Photo{}, err
-		}
-		p := Photo{Asset: r.asset, Img: img}
-		if j.wantInfo() {
-			if info, err := j.client.AssetInfo(r.asset.ID); err == nil {
-				p.Info = info
-			} else {
-				log.Printf("infos %s : %v", r.asset.ID, err)
-			}
-		}
-		return p, nil
-	}
-
-	return func() (Photo, error) {
+	return func() (rawPhoto, error) {
 		for i < len(order) && tries < 15*n {
 			a := order[i]
 			i++
@@ -325,7 +352,7 @@ func (j *job) online(n int, assets []Asset) func() (Photo, error) {
 			data, err := j.client.Download(a.ID, j.cfg.ImageSize)
 			if err != nil {
 				if errors.Is(err, errUnauthorized) {
-					return Photo{}, err
+					return rawPhoto{}, err
 				}
 				lastErr = err
 				log.Printf("%v", err)
@@ -336,35 +363,158 @@ func (j *job) online(n int, assets []Asset) func() (Photo, error) {
 				log.Printf("%s (%s) : %v", a.ID, a.OriginalFileName, err)
 				continue
 			}
-			r := raw{a, data, meta}
+			r := rawPhoto{asset: a, data: data, meta: meta}
 			if j.cfg.LandscapeOnly && meta.W <= meta.H {
 				if len(portraits) < n {
 					portraits = append(portraits, r)
 				}
 				continue
 			}
-			p, err := build(r)
-			if err != nil {
-				log.Printf("%s : %v", a.ID, err)
-				continue
-			}
-			return p, nil
+			return r, nil
 		}
-		for len(portraits) > 0 { // pas assez de paysages : on complète
+		if len(portraits) > 0 { // pas assez de paysages : on complète
 			r := portraits[0]
 			portraits = portraits[1:]
-			p, err := build(r)
+			return r, nil
+		}
+		if lastErr != nil {
+			return rawPhoto{}, lastErr
+		}
+		return rawPhoto{}, fmt.Errorf("aucune image utilisable après %d essais (voir le journal)", tries)
+	}
+}
+
+// fetchInfo complète la photo avec le lieu et la date (si la légende est demandée).
+func (j *job) fetchInfo(r *rawPhoto) {
+	if r.hasInfo || !j.wantInfo() {
+		return
+	}
+	if info, err := j.client.AssetInfo(r.asset.ID); err == nil {
+		r.info, r.hasInfo = info, true
+	} else {
+		log.Printf("infos %s : %v", r.asset.ID, err)
+	}
+}
+
+// build décode l'image (sRGB, redressée) et la complète de ses informations.
+func (j *job) build(r rawPhoto) (Photo, error) {
+	img, err := safeDecode(func() (image.Image, error) { return r.meta.decode(r.data) })
+	if err != nil {
+		return Photo{}, err
+	}
+	j.fetchInfo(&r)
+	return Photo{Asset: r.asset, Img: img, Info: r.info}, nil
+}
+
+// online renvoie une source de photos téléchargées depuis Immich et décodées, une par appel :
+// seule la photo demandée est en mémoire.
+func (j *job) online(n int, assets []Asset) func() (Photo, error) {
+	next := j.rawSource(n, assets)
+	return func() (Photo, error) {
+		for {
+			r, err := next()
+			if err != nil {
+				return Photo{}, err
+			}
+			p, err := j.build(r)
 			if err != nil {
 				log.Printf("%s : %v", r.asset.ID, err)
 				continue
 			}
 			return p, nil
 		}
-		if lastErr != nil {
-			return Photo{}, lastErr
-		}
-		return Photo{}, fmt.Errorf("aucune image utilisable après %d essais (voir le journal)", tries)
 	}
+}
+
+// ---------- préchargement ----------
+
+// preItem : photo du prochain changement, déjà téléchargée et gardée sur disque (pas en RAM).
+type preItem struct {
+	asset   Asset
+	info    AssetInfo
+	hasInfo bool
+	path    string
+}
+
+// Preload télécharge à l'avance les photos du prochain changement (et leurs informations) :
+// le changement suivant n'a alors plus besoin du réseau — utile au déverrouillage du PC.
+func (c *Core) Preload() (err error) {
+	c.run.Lock()
+	defer c.run.Unlock()
+	defer debug.FreeOSMemory()
+	defer guard("le préchargement", &err)
+	j, err := c.begin()
+	if err != nil || !j.cfg.Preload {
+		return err
+	}
+	_, _, n := j.targets()
+	key := j.albumKey()
+	assets, err := j.refreshAlbums()
+	if err != nil {
+		return err
+	}
+	dir := c.preloadDir()
+	os.RemoveAll(dir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	next := j.rawSource(n, assets)
+	var items []preItem
+	for len(items) < n {
+		r, err := next()
+		if err != nil {
+			if len(items) == 0 {
+				return err
+			}
+			break
+		}
+		j.fetchInfo(&r)
+		path := filepath.Join(dir, r.asset.ID+".img")
+		if err := os.WriteFile(path, r.data, 0o644); err != nil {
+			return err
+		}
+		items = append(items, preItem{r.asset, r.info, r.hasInfo, path})
+	}
+	c.mu.Lock()
+	if c.gen == j.gen {
+		c.preloaded, c.preGen, c.preKey = items, j.gen, key
+	}
+	c.mu.Unlock()
+	log.Printf("photo suivante préchargée (%d)", len(items))
+	return nil
+}
+
+// takePreloaded renvoie les photos préchargées si elles valent encore pour ce tirage
+// (même configuration, mêmes albums, photos non exclues depuis).
+func (j *job) takePreloaded() []preItem {
+	c := j.c
+	c.mu.Lock()
+	items, ok := c.preloaded, c.preGen == j.gen && c.preKey == j.albumKey()
+	c.preloaded = nil
+	var keep []preItem
+	for _, it := range items {
+		if ok && !c.excluded[it.asset.ID] {
+			keep = append(keep, it)
+		} else {
+			os.Remove(it.path)
+		}
+	}
+	c.mu.Unlock()
+	return keep
+}
+
+// fromPreload décode une photo préchargée ; son fichier est supprimé.
+func (j *job) fromPreload(it preItem) (Photo, error) {
+	data, err := os.ReadFile(it.path)
+	os.Remove(it.path)
+	if err != nil {
+		return Photo{}, err
+	}
+	meta, err := probeImage(data)
+	if err != nil {
+		return Photo{}, err
+	}
+	return j.build(rawPhoto{asset: it.asset, data: data, meta: meta, info: it.info, hasInfo: it.hasInfo})
 }
 
 // ---------- cache hors ligne ----------
@@ -630,23 +780,140 @@ func (c *Core) Reapply() (res Result, err error) {
 	if len(last) < n {
 		return Result{}, errNeedDraw
 	}
-	i := 0
-	next := func() (Photo, error) {
-		k := last[i]
-		i++
-		img, err := jpeg.Decode(bytes.NewReader(k.JPEG))
-		if err != nil {
-			return Photo{}, err
-		}
-		return Photo{Asset: k.Asset, Img: img, Info: k.Info, jpg: k.JPEG}, nil
-	}
-	path, err := j.applyTo(next, mons, single)
+	_, path, err := j.applyKept(last, mons, single)
 	if err != nil {
 		return Result{}, err
 	}
 	log.Printf("écrans modifiés : fond d'écran recalculé (%d photo(s))", n)
 	j.lockScreen(path)
 	return Result{Asset: last[0].Asset}, nil
+}
+
+// applyKept applique des photos déjà mémorisées (compressées), en les répétant s'il y a plus
+// d'emplacements que de photos. Renvoie les photos dans l'ordre d'affichage.
+func (j *job) applyKept(set []keptPhoto, mons []Monitor, single Screen) ([]keptPhoto, string, error) {
+	var shown []keptPhoto
+	next := func() (Photo, error) {
+		k := set[len(shown)%len(set)]
+		img, err := jpeg.Decode(bytes.NewReader(k.JPEG))
+		if err != nil {
+			return Photo{}, err
+		}
+		shown = append(shown, k)
+		return Photo{Asset: k.Asset, Img: img, Info: k.Info, jpg: k.JPEG}, nil
+	}
+	path, err := j.applyTo(next, mons, single)
+	return shown, path, err
+}
+
+// Previous réaffiche le fond d'écran précédent (jusqu'à historyDepth retours en arrière).
+func (c *Core) Previous() (res Result, err error) {
+	c.run.Lock()
+	defer c.run.Unlock()
+	defer debug.FreeOSMemory()
+	defer guard("le retour à la photo précédente", &err)
+	j, err := c.begin()
+	if err != nil {
+		return Result{}, err
+	}
+	c.mu.Lock()
+	var set []keptPhoto
+	if n := len(c.history); n > 0 {
+		set = c.history[n-1]
+	}
+	c.mu.Unlock()
+	if len(set) == 0 {
+		return Result{}, errNoPrevious
+	}
+	mons, single, _ := j.targets()
+	shown, path, err := j.applyKept(set, mons, single)
+	if err != nil {
+		return Result{}, err
+	}
+	first := shown[0].Asset
+	c.mu.Lock()
+	if n := len(c.history); n > 0 {
+		c.history = c.history[:n-1]
+	}
+	c.lastPhotos = shown
+	c.last, c.lastOK = first, true
+	c.mu.Unlock()
+	log.Printf("photo précédente : %s (%s)", first.OriginalFileName, first.ID)
+	if c.afterApply != nil {
+		c.afterApply(j.cfg, first, j.client.WebURL(first.ID))
+	}
+	j.lockScreen(path)
+	return Result{Asset: first}, nil
+}
+
+// ExcludeCurrent ajoute la photo affichée (celle de l'écran principal) à la liste des photos
+// à ne plus afficher. La liste est locale (excluded.json) : rien n'est modifié dans Immich.
+func (c *Core) ExcludeCurrent() (Asset, error) {
+	c.mu.Lock()
+	if !c.lastOK {
+		c.mu.Unlock()
+		return Asset{}, errors.New("aucune photo affichée")
+	}
+	a := c.last
+	c.excluded[a.ID] = true
+	var history [][]keptPhoto
+	for _, set := range c.history { // elle ne doit pas revenir par « Photo précédente »
+		var kept []keptPhoto
+		for _, k := range set {
+			if k.Asset.ID != a.ID {
+				kept = append(kept, k)
+			}
+		}
+		if len(kept) > 0 {
+			history = append(history, kept)
+		}
+	}
+	c.history = history
+	err := c.saveExcluded()
+	c.mu.Unlock()
+	if isUUID(a.ID) {
+		os.Remove(filepath.Join(c.cacheDir(), a.ID+".jpg"))
+		os.Remove(filepath.Join(c.cacheDir(), a.ID+".json"))
+	}
+	log.Printf("photo masquée : %s (%s)", a.OriginalFileName, a.ID)
+	return a, err
+}
+
+// saveExcluded écrit la liste d'exclusion (appelé sous c.mu).
+func (c *Core) saveExcluded() error {
+	ids := make([]string, 0, len(c.excluded))
+	for id := range c.excluded {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	b, _ := json.Marshal(ids)
+	return os.WriteFile(c.excludedPath(), b, 0o644)
+}
+
+// ExcludedCount : nombre de photos masquées.
+func (c *Core) ExcludedCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.excluded)
+}
+
+// ClearExcluded réautorise toutes les photos masquées.
+func (c *Core) ClearExcluded() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.excluded = map[string]bool{}
+	return c.saveExcluded()
+}
+
+// Favorite ajoute la photo affichée (écran principal) aux favoris Immich.
+func (c *Core) Favorite() (Asset, error) {
+	c.mu.Lock()
+	a, ok, client := c.last, c.lastOK, c.client
+	c.mu.Unlock()
+	if !ok || client == nil {
+		return Asset{}, errors.New("aucune photo affichée")
+	}
+	return a, client.SetFavorite(a.ID)
 }
 
 // Next choisit et applique de nouvelles images (une par écran si demandé).
@@ -668,22 +935,43 @@ func (j *job) next() (Result, error) {
 
 	res := Result{}
 	f := &feeder{j: j, cache: true}
-	assets, err := j.refreshAlbums()
-	if err == nil {
-		f.src = j.online(n, assets)
-		var p Photo
-		if p, err = f.fetch(); err == nil {
-			f.head = &p
+	// Photos préchargées d'abord (aucun accès réseau), puis téléchargement à la demande.
+	pre := j.takePreloaded()
+	var online func() (Photo, error)
+	f.src = func() (Photo, error) {
+		for len(pre) > 0 {
+			it := pre[0]
+			pre = pre[1:]
+			p, err := j.fromPreload(it)
+			if err == nil {
+				return p, nil
+			}
+			log.Printf("photo préchargée %s inutilisable : %v", it.asset.ID, err)
 		}
+		if online == nil {
+			assets, err := j.refreshAlbums()
+			if err != nil {
+				return Photo{}, err
+			}
+			online = j.online(n, assets)
+		}
+		return online()
 	}
-	if err != nil {
+	defer func() { // préchargées non utilisées (moins d'écrans que prévu, erreur)
+		for _, it := range pre {
+			os.Remove(it.path)
+		}
+	}()
+	if p, err := f.fetch(); err == nil {
+		f.head = &p
+	} else {
 		off := &feeder{j: j, src: j.cached()}
-		p, cerr := off.fetch()
+		cp, cerr := off.fetch()
 		if cerr != nil {
 			return Result{}, err
 		}
 		log.Printf("Immich injoignable (%v) : photo du cache hors ligne", err)
-		off.head = &p
+		off.head = &cp
 		f, res.Offline, res.Cause = off, true, err
 	}
 
@@ -693,11 +981,18 @@ func (j *job) next() (Result, error) {
 	}
 	first := f.shown[0].Asset
 
-	pool := len(assets)
-	if res.Offline {
-		pool = len(c.cachedIDs())
-	}
+	offlinePool := len(c.cachedIDs())
 	c.mu.Lock()
+	pool := len(c.assets)
+	if res.Offline {
+		pool = offlinePool
+	}
+	if len(c.lastPhotos) > 0 { // pour « Photo précédente »
+		c.history = append(c.history, c.lastPhotos)
+		if len(c.history) > historyDepth {
+			c.history = c.history[len(c.history)-historyDepth:]
+		}
+	}
 	c.lastPhotos = f.shown
 	for _, k := range f.distinct {
 		c.remember(k.Asset.ID, pool, n)

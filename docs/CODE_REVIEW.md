@@ -308,4 +308,13 @@ Classées par rapport valeur/effort estimé.
 | D9 | Appliqué | README corrigé. |
 | D10 | Partiel | `max` masqué, double lecture des métadonnées, chemin des polices, historique `recent` persistant, `go.mod` aligné. Non faits : valeurs par défaut dupliquées dans la page, génération des `.syso` en CI. |
 
-Les idées de fonctionnalités (section 4) ne sont pas traitées ici.
+### Idées de fonctionnalités (section 4)
+
+| Idée | État | Détail |
+|---|---|---|
+| 2 — Actions depuis l'icône | Fait | « Photo précédente » (5 retours en arrière, en mémoire), « Ajouter aux favoris Immich » (permission `asset.update`), « Ne plus afficher cette photo » (liste locale `excluded.json`, réversible depuis la page de réglages). |
+| 6 — Historique persistant | Partiel | Photos récentes conservées d'un lancement à l'autre (`recent.json`). |
+| 7 — Planification contextuelle | Fait | Plage horaire, albums selon la saison ou l'heure, pause sur batterie, connexion limitée ou plein écran. |
+| 8 — Sécurité visible | Partiel | Clé protégée par DPAPI et certificat épinglé ; mises à jour signées non faites. |
+| 9 — Préchargement | Fait | Photo suivante (et sa légende) téléchargée à l'avance sur disque ; le changement suivant ne fait aucune requête. |
+| 1, 3, 4, 5, 10, 11 | Non fait | — |

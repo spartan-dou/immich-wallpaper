@@ -35,6 +35,7 @@ type App struct {
 	paused   bool
 	status   string
 	failures int           // échecs consécutifs (temporisation croissante)
+	hold     string        // pourquoi le changement automatique attend (batterie, plein écran…)
 	wake     chan struct{} // réveille la planification quand l'échéance change
 	busy     atomic.Bool
 	updating atomic.Bool
@@ -98,6 +99,8 @@ func main() {
 		return "Nouvelle image : " + as.OriginalFileName, nil
 	}
 	a.settings.Status = a.getStatus
+	a.settings.Excluded = a.core.ExcludedCount
+	a.settings.OnClearExcluded = a.core.ClearExcluded
 
 	systray.Run(a.onReady, func() { log.Printf("--- arrêt") })
 	if a.pending != nil {
@@ -121,6 +124,8 @@ func (a *App) getStatus() string {
 	s := a.status
 	if a.paused {
 		s += " · en pause"
+	} else if a.hold != "" {
+		s += " · en attente (" + a.hold + ")"
 	} else if !a.next.IsZero() && a.cfg != nil {
 		s += " · prochaine à " + a.next.Format("15:04")
 	}
@@ -175,6 +180,84 @@ func recovered(what string) {
 	}
 }
 
+// blocked indique pourquoi un changement automatique doit attendre ("" = rien ne s'y oppose).
+// hours=false ignore la plage horaire (préchargement).
+func blocked(cfg *Config, hours bool) string {
+	switch {
+	case hours && !cfg.activeAt(time.Now()):
+		return "hors plage horaire"
+	case cfg.PauseOnBattery && onBattery():
+		return "sur batterie"
+	case cfg.PauseOnFullscreen && fullscreenBusy():
+		return "application en plein écran"
+	case cfg.PauseOnMetered && meteredConnection():
+		return "connexion limitée"
+	}
+	return ""
+}
+
+// preload prépare la photo suivante en arrière-plan, sauf si le contexte s'y oppose.
+func (a *App) preload() {
+	defer recovered("préchargement")
+	a.mu.Lock()
+	cfg := a.cfg
+	a.mu.Unlock()
+	if cfg == nil || !cfg.Preload || blocked(cfg, false) != "" {
+		return
+	}
+	if err := a.core.Preload(); err != nil {
+		log.Printf("préchargement : %v", err)
+	}
+}
+
+// previous réaffiche le fond d'écran précédent et repousse le prochain changement.
+func (a *App) previous() {
+	defer recovered("photo précédente")
+	if !a.busy.CompareAndSwap(false, true) {
+		return
+	}
+	defer a.busy.Store(false)
+	res, err := a.core.Previous()
+	if err != nil {
+		if !errors.Is(err, errNoPrevious) {
+			log.Printf("photo précédente : %v", err)
+		}
+		a.setStatus("Photo précédente : " + err.Error())
+		return
+	}
+	a.mu.Lock()
+	if a.cfg != nil {
+		a.next = time.Now().Add(time.Duration(a.cfg.IntervalMinutes) * time.Minute)
+	}
+	a.mu.Unlock()
+	a.poke()
+	a.setStatus("Photo précédente : " + res.Asset.OriginalFileName)
+}
+
+// favorite ajoute la photo affichée aux favoris Immich.
+func (a *App) favorite() {
+	defer recovered("favori")
+	as, err := a.core.Favorite()
+	if err != nil {
+		log.Printf("ajout aux favoris : %v", err)
+		a.setStatus("Favori impossible : " + err.Error())
+		return
+	}
+	log.Printf("ajoutée aux favoris Immich : %s (%s)", as.OriginalFileName, as.ID)
+	a.setStatus("Ajoutée aux favoris Immich : " + as.OriginalFileName)
+}
+
+// hide masque définitivement la photo affichée (liste locale) et passe à la suivante.
+func (a *App) hide() {
+	defer recovered("photo masquée")
+	if _, err := a.core.ExcludeCurrent(); err != nil {
+		log.Printf("photo masquée : %v", err)
+		a.setStatus("Impossible de masquer la photo : " + err.Error())
+		return
+	}
+	a.change()
+}
+
 func (a *App) change() (as Asset, err error) {
 	if !a.busy.CompareAndSwap(false, true) {
 		return Asset{}, errors.New("un changement est déjà en cours")
@@ -198,6 +281,7 @@ func (a *App) change() (as Asset, err error) {
 	switch {
 	case err == nil:
 		a.failures = 0
+		a.hold = ""
 		a.next = time.Now().Add(interval)
 	case isAuthErr(err):
 		a.next = time.Now().Add(30 * time.Minute)
@@ -225,6 +309,9 @@ func (a *App) change() (as Asset, err error) {
 	}
 	a.setStatus(st)
 	a.mOpenPic.Enable()
+	if !res.Offline {
+		go a.preload() // la photo suivante est prête avant le prochain changement
+	}
 	return as, nil
 }
 
@@ -236,8 +323,11 @@ func (a *App) onReady() {
 	a.mStatus.Disable()
 	systray.AddSeparator()
 	mNext := systray.AddMenuItem("Image suivante", "Changer le fond d'écran maintenant")
+	mPrev := systray.AddMenuItem("Photo précédente", "Revenir au fond d'écran précédent")
 	a.mOpenPic = systray.AddMenuItem("Voir la photo dans Immich", "")
 	a.mOpenPic.Disable()
+	mFav := systray.AddMenuItem("Ajouter aux favoris Immich", "Marquer la photo affichée comme favorite")
+	mHide := systray.AddMenuItem("Ne plus afficher cette photo", "La masquer (réversible dans les paramètres) et passer à la suivante")
 	systray.AddSeparator()
 	mSettings := systray.AddMenuItem("Paramètres…", "Ouvrir la page de réglages")
 	mPause := systray.AddMenuItemCheckbox("Pause", "Ne plus changer automatiquement", false)
@@ -292,16 +382,26 @@ func (a *App) onReady() {
 		t := time.NewTimer(time.Hour)
 		check := func() {
 			a.mu.Lock()
-			active := a.cfg != nil && !a.paused
+			cfg := a.cfg
+			active := cfg != nil && !a.paused
 			wait := time.Until(a.next)
 			a.mu.Unlock()
+			hold := ""
 			switch {
 			case !active:
 				wait = time.Minute
 			case wait <= 0:
-				go a.change()
-				wait = 10 * time.Second // change() réveille la boucle dès qu'il a fixé la suite
+				// Échéance atteinte : on attend si le contexte s'y oppose (réévalué chaque minute).
+				if hold = blocked(cfg, true); hold != "" {
+					wait = time.Minute
+				} else {
+					go a.change()
+					wait = 10 * time.Second // change() réveille la boucle dès qu'il a fixé la suite
+				}
 			}
+			a.mu.Lock()
+			a.hold = hold
+			a.mu.Unlock()
 			t.Reset(min(wait, time.Minute))
 		}
 		check()
@@ -313,6 +413,12 @@ func (a *App) onReady() {
 				check()
 			case <-mNext.ClickedCh:
 				go a.change()
+			case <-mPrev.ClickedCh:
+				go a.previous()
+			case <-mFav.ClickedCh:
+				go a.favorite()
+			case <-mHide.ClickedCh:
+				go a.hide()
 			case <-a.mOpenPic.ClickedCh:
 				if _, u, ok := a.core.Last(); ok {
 					shellOpen(u)
@@ -402,7 +508,7 @@ func (a *App) handleSystemEvents() {
 			if cfg == nil {
 				continue
 			}
-			if ev == evUnlock && cfg.ChangeOnUnlock && !paused {
+			if ev == evUnlock && cfg.ChangeOnUnlock && !paused && blocked(cfg, true) == "" {
 				log.Printf("session déverrouillée : nouvelle image")
 				go a.change()
 			} else {

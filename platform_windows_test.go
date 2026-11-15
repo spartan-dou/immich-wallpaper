@@ -73,3 +73,22 @@ func TestReplaceFileSync(t *testing.T) {
 		t.Fatal(string(b))
 	}
 }
+
+// Les fonctions de contexte doivent répondre sans erreur ni blocage sur un vrai Windows.
+func TestSystemContext(t *testing.T) {
+	cost, err := connectionCost()
+	if err != nil {
+		t.Fatal("coût de la connexion illisible :", err)
+	}
+	t.Logf("batterie=%v plein écran=%v coût connexion=%#x limitée=%v", onBattery(), fullscreenBusy(), cost, meteredConnection())
+	cfg := defaultConfig()
+	if blocked(&cfg, true) != "" {
+		t.Fatal("rien ne doit bloquer avec la configuration par défaut")
+	}
+	cfg.ActiveFrom, cfg.ActiveTo = "00:00", "00:01"
+	if now := time.Now(); now.Hour() != 0 || now.Minute() != 0 {
+		if blocked(&cfg, true) != "hors plage horaire" || blocked(&cfg, false) != "" {
+			t.Fatal("plage horaire non respectée")
+		}
+	}
+}

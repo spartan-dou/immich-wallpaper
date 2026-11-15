@@ -38,6 +38,15 @@ type Config struct {
 	OfflineCache       int      `json:"offline_cache"`    // nombre de photos gardées pour le mode hors ligne (0 = désactivé)
 	SplitWide          bool     `json:"split_wide"`       // écran très large (32:9) : deux photos côte à côte
 	ChangeOnUnlock     bool     `json:"change_on_unlock"` // nouvelle photo à chaque déverrouillage de session
+
+	// Planification contextuelle (changements automatiques uniquement ; « Image suivante » reste possible).
+	ActiveFrom        string      `json:"active_from"`         // plage horaire des changements, "HH:MM" (vide = toute la journée)
+	ActiveTo          string      `json:"active_to"`           //
+	PauseOnBattery    bool        `json:"pause_on_battery"`    // pas de changement sur batterie
+	PauseOnMetered    bool        `json:"pause_on_metered"`    // pas de changement sur une connexion limitée
+	PauseOnFullscreen bool        `json:"pause_on_fullscreen"` // pas de changement pendant une appli en plein écran
+	AlbumRules        []AlbumRule `json:"album_rules"`         // albums selon la saison ou l'heure
+	Preload           bool        `json:"preload"`             // photo suivante téléchargée à l'avance
 }
 
 func defaultConfig() Config {
@@ -58,6 +67,8 @@ func defaultConfig() Config {
 		OfflineCache:    40,
 		SplitWide:       true,
 		ChangeOnUnlock:  true,
+		AlbumRules:      []AlbumRule{},
+		Preload:         true,
 	}
 }
 
@@ -199,6 +210,9 @@ func (c *Config) normalize() error {
 	}
 	c.Albums = ids
 
+	if err := c.normalizeSchedule(); err != nil {
+		return err
+	}
 	if c.IntervalMinutes < 1 {
 		c.IntervalMinutes = 60
 	}

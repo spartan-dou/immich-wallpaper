@@ -34,7 +34,7 @@ Supprime : le programme, le démarrage auto, le raccourci, la config (dont le to
 ## Clé API Immich
 
 Immich → avatar → Paramètres du compte → Clés API → Nouvelle clé.
-Permissions : `album.read`, `asset.read`, `asset.view`, `asset.download`.
+Permissions : `album.read`, `asset.read`, `asset.view`, `asset.download` ; `asset.update` en plus si tu veux utiliser « Ajouter aux favoris Immich ».
 Sans `asset.download`, l'appli fonctionne mais se rabat sur l'aperçu (1440 px) quand Immich redirige la pleine résolution vers l'original.
 
 La clé est chiffrée dans `config.json` avec DPAPI (`api_key_protected`, lisible uniquement par ton compte Windows sur ce PC). Une clé écrite à la main dans `api_key` est acceptée et chiffrée au démarrage suivant. Elle n'est envoyée qu'au serveur pour lequel elle a été saisie : si tu changes l'URL du serveur, il faut la ressaisir.
@@ -44,12 +44,26 @@ La clé est chiffrée dans `config.json` avec DPAPI (`api_key_protected`, lisibl
 ## Menu de l'icône
 
 - **Image suivante** : change tout de suite.
+- **Photo précédente** : réaffiche le fond d'écran précédent (jusqu'à 5 retours en arrière, depuis le lancement de l'appli) et repousse le prochain changement.
 - **Voir la photo dans Immich** : ouvre la photo affichée.
+- **Ajouter aux favoris Immich** : marque la photo affichée comme favorite (la clé API doit avoir la permission `asset.update`).
+- **Ne plus afficher cette photo** : la masque et passe à la suivante. La liste est locale (`excluded.json`), rien n'est modifié dans Immich ; la page de réglages indique le nombre de photos masquées et permet de les réafficher.
+
+Avec plusieurs photos affichées (plusieurs écrans, écran très large), ces actions portent sur celle de l'écran principal.
 - **Paramètres…** : rouvre la page de réglages (servie localement sur 127.0.0.1, protégée par un jeton aléatoire, le token Immich n'y est jamais réaffiché).
 - **Pause**, **Démarrer avec Windows**, **Ouvrir le journal**.
 - **Rechercher une mise à jour** : vérifie tout de suite et propose l'installation.
 - **Désinstaller…** : supprime le programme, ses réglages et le démarrage automatique.
 - **Quitter**.
+
+## Planification
+
+Réglages → **Planification**. Ces réglages ne concernent que les changements automatiques (intervalle, déverrouillage) : **Image suivante** fonctionne toujours.
+
+- **Plage horaire** : les changements n'ont lieu qu'entre deux heures (une plage comme 22:00 → 07:00 passe par minuit).
+- **Pas de changement** sur batterie, sur une connexion limitée (partage de connexion, forfait de données) ou pendant une application en plein écran (jeu, vidéo, présentation). Le changement en attente se fait dès que la condition disparaît ; l'état l'indique (« en attente (sur batterie) »).
+- **Albums selon la saison ou l'heure** : chaque règle associe des albums à une saison (printemps mars-mai, été juin-août, automne sept.-nov., hiver déc.-fév.) et/ou à une plage horaire. Quand une règle s'applique, ses albums remplacent les albums habituels ; plusieurs règles simultanées sont réunies.
+- **Photo suivante téléchargée à l'avance** (activé par défaut) : après chaque changement, la photo suivante est téléchargée dans `%APPDATA%\ImmichWallpaper\preload`, avec son lieu et sa date. Le changement suivant est alors immédiat et ne dépend plus du réseau, en particulier au déverrouillage du PC. Rien n'est préchargé sur batterie, connexion limitée ou en plein écran si ces pauses sont activées.
 
 ## Légende et écran de verrouillage
 
@@ -67,7 +81,7 @@ Immich génère par défaut ses aperçus en Display P3 (profil ICC intégré). W
 
 ## Fichiers
 
-Tout est dans `%APPDATA%\ImmichWallpaper\` : `config.json` (éditable à la main aussi), `journal.txt` (1 Mo max, le précédent est gardé dans `journal.1.txt`), `recent.json` (photos affichées récemment, pour ne pas les revoir après un redémarrage), le dossier `cache` et les deux images `wallpaper_a/b.jpg`.
+Tout est dans `%APPDATA%\ImmichWallpaper\` : `config.json` (éditable à la main aussi), `journal.txt` (1 Mo max, le précédent est gardé dans `journal.1.txt`), `recent.json` (photos affichées récemment, pour ne pas les revoir après un redémarrage), `excluded.json` (photos masquées), les dossiers `cache` (hors ligne) et `preload` (photo suivante) et les deux images `wallpaper_a/b.jpg`.
 
 ## Comportement
 
@@ -102,6 +116,8 @@ Les fichiers `rsrc_windows_*.syso` contiennent l'icône et le manifeste (DPI, co
 | `render.go`, `caption.go` | recadrage, carte lieu/date |
 | `settings.go`, `settings.html` | page de réglages locale |
 | `logfile.go` | journal avec rotation |
+| `schedule.go` | plage horaire, règles d'albums par saison/heure |
+| `context_windows.go` | batterie, plein écran, connexion limitée |
 | `win_windows.go`, `install_windows.go` | API Windows, installation/désinstallation |
 | `monitors_windows.go` | une image par écran (COM `IDesktopWallpaper`) |
 | `events_windows.go` | déverrouillage, changements d'écran, sortie de veille |
