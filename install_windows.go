@@ -35,7 +35,19 @@ func installDir() string {
 
 func installedExe() string { return filepath.Join(installDir(), "ImmichWallpaper.exe") }
 
+// portableDataDir : dossier de données de la version portable, à côté de l'exe.
+func portableDataDir(exe string) string {
+	return filepath.Join(filepath.Dir(exe), "ImmichWallpaper-data")
+}
+
+// dataDir : %APPDATA%\ImmichWallpaper, ou un dossier à côté de l'exe pour la version portable
+// (réglages, journal, cache et images suivent alors l'exe, rien n'est écrit ailleurs).
 func dataDir() string {
+	if isPortable() {
+		if exe, err := os.Executable(); err == nil {
+			return portableDataDir(exe)
+		}
+	}
 	base, err := os.UserConfigDir()
 	if err != nil {
 		base = os.TempDir()
@@ -215,23 +227,29 @@ func setAutostartPath(exe string) error {
 // Renvoie true si le processus courant doit s'arrêter (la copie installée a été lancée).
 func maybeInstall() bool {
 	self, err := os.Executable()
-	if err != nil || samePath(self, installedExe()) {
+	if err != nil || isPortable() || samePath(self, installedExe()) {
 		return false
 	}
-	q := "Installer Immich Wallpaper sur ce PC ?\n\n" +
+	// L'installeur ne sait qu'installer : refuser, c'est quitter. L'exe classique peut aussi
+	// être lancé sans installation.
+	refuse := "« Non » = lancer sans installer."
+	if isSetup() {
+		refuse = "« Non » = annuler."
+	}
+	q := "Installer Immich Wallpaper " + appVersion + " sur ce PC ?\n\n" +
 		"• copie dans " + installDir() + "\n" +
 		"• raccourci dans le menu Démarrer, lancement avec Windows\n" +
-		"• désinstallable depuis Paramètres → Applications installées\n\n" +
-		"« Non » = lancer sans installer."
+		"• désinstallable depuis Paramètres → Applications installées\n\n" + refuse
 	if isInstalled() {
-		q = "Immich Wallpaper est déjà installé.\n\nRemplacer la version installée par celle-ci (" + appVersion + ") ?\nTa configuration est conservée.\n\n« Non » = lancer sans installer."
+		q = "Immich Wallpaper est déjà installé.\n\nRemplacer la version installée par celle-ci (" + appVersion + ") ?\nTa configuration est conservée.\n\n" + refuse
 	}
-	if !confirm(q) {
-		return false
+	// --quiet : installation sans question (déploiement automatisé), installeur uniquement.
+	if !(isSetup() && hasArg("--quiet")) && !confirm(q) {
+		return isSetup()
 	}
 	if err := install(); err != nil {
 		msgBox("Immich Wallpaper", "Installation impossible : "+err.Error(), mbIconError)
-		return false
+		return isSetup()
 	}
 	if err := hiddenCmd(installedExe()).Start(); err != nil {
 		msgBox("Immich Wallpaper", "Installé, mais impossible de le lancer : "+err.Error(), mbIconError)

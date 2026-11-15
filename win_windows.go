@@ -30,6 +30,7 @@ const (
 	spifSendChange      = 0x02
 	runKey              = `Software\Microsoft\Windows\CurrentVersion\Run`
 	runValue            = "ImmichWallpaper"
+	runValuePortable    = "ImmichWallpaperPortable"
 )
 
 func setWallpaper(path, style string) error {
@@ -119,13 +120,22 @@ func unprotectSecret(enc string) (string, error) {
 	return string(unsafe.Slice(out.Data, out.Size)), nil
 }
 
+// autostartValue : nom de l'entrée « démarrage automatique ». La version portable a la sienne,
+// pour ne pas modifier celle d'une copie installée sur le même PC.
+func autostartValue() string {
+	if isPortable() {
+		return runValuePortable
+	}
+	return runValue
+}
+
 func autostartEnabled() bool {
 	k, err := registry.OpenKey(registry.CURRENT_USER, runKey, registry.QUERY_VALUE)
 	if err != nil {
 		return false
 	}
 	defer k.Close()
-	_, _, err = k.GetStringValue(runValue)
+	_, _, err = k.GetStringValue(autostartValue())
 	return err == nil
 }
 
@@ -136,7 +146,7 @@ func setAutostart(on bool) error {
 	}
 	defer k.Close()
 	if !on {
-		err := k.DeleteValue(runValue)
+		err := k.DeleteValue(autostartValue())
 		if err == registry.ErrNotExist {
 			return nil
 		}
@@ -146,7 +156,7 @@ func setAutostart(on bool) error {
 	if err != nil {
 		return err
 	}
-	return k.SetStringValue(runValue, `"`+exe+`"`)
+	return k.SetStringValue(autostartValue(), `"`+exe+`"`)
 }
 
 // singleInstance renvoie false si l'appli tourne déjà.

@@ -102,16 +102,22 @@ jobs:
           echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
           echo "Version : $VERSION (release : $RELEASE)"
 
-      - name: Build Windows x64 + ARM64
+      - name: Build Windows x64 + ARM64 (classique, installeur, portable)
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p dist
+          # Trois exécutables par architecture :
+          #   ImmichWallpaper-<arch>.exe          exe classique (téléchargé par la mise à jour automatique)
+          #   ImmichWallpaper-setup-<arch>.exe    installeur
+          #   ImmichWallpaper-portable-<arch>.exe version portable (données à côté de l'exe)
           for arch in amd64 arm64; do
             name=$([ "$arch" = amd64 ] && echo x64 || echo arm64)
-            GOOS=windows GOARCH=$arch CGO_ENABLED=0 go build -trimpath \
-              -ldflags "-H windowsgui -s -w -X main.appVersion=$VERSION" \
-              -o "dist/ImmichWallpaper-$name.exe" .
+            for flavor in "" setup portable; do
+              GOOS=windows GOARCH=$arch CGO_ENABLED=0 go build -trimpath \
+                -ldflags "-H windowsgui -s -w -X main.appVersion=$VERSION -X main.flavor=$flavor" \
+                -o "dist/ImmichWallpaper-${flavor:+$flavor-}$name.exe" .
+            done
           done
           (cd dist && sha256sum *.exe > SHA256SUMS.txt)
           ls -la dist

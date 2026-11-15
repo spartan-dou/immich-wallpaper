@@ -47,7 +47,9 @@ type App struct {
 func main() {
 	debug.SetMemoryLimit(256 << 20) // GC plus agressif au-delà : limite le pic de RAM
 	for _, arg := range os.Args[1:] {
-		if arg == "--uninstall" {
+		// La version portable n'est pas installée : rien à désinstaller (et surtout pas une
+		// éventuelle copie installée sur le même PC).
+		if arg == "--uninstall" && !isPortable() {
 			uninstall(hasArg("--quiet"))
 			return
 		}
@@ -65,13 +67,22 @@ func main() {
 	}
 	a := &App{dir: dataDir(), wake: make(chan struct{}, 1)}
 	dirErr := os.MkdirAll(a.dir, 0o755)
+	if dirErr != nil && isPortable() {
+		msgBox("Immich Wallpaper", "Version portable : impossible de créer le dossier de données à côté de l'exe.\n"+
+			"Place-la dans un dossier où tu peux écrire.\n\n"+dirErr.Error(), mbIconError)
+		return
+	}
 	a.cfgPath = filepath.Join(a.dir, "config.json")
 	a.logPath = filepath.Join(a.dir, "journal.txt")
 	// Journal borné à 1 Mo, l'ancien est gardé dans journal.1.txt.
 	if l, err := openRotatingLog(a.logPath, 1<<20); err == nil {
 		log.SetOutput(l)
 	}
-	log.Printf("--- démarrage v%s, dossier %s", appVersion, a.dir)
+	kind := ""
+	if isPortable() {
+		kind = " (portable)"
+	}
+	log.Printf("--- démarrage v%s%s, dossier %s", appVersion, kind, a.dir)
 	if dirErr != nil {
 		log.Printf("dossier de données : %v", dirErr)
 	}
@@ -335,6 +346,9 @@ func (a *App) onReady() {
 	mLog := systray.AddMenuItem("Ouvrir le journal", "")
 	mUpdate := systray.AddMenuItem("Rechercher une mise à jour", "Version actuelle : "+appVersion)
 	mUninstall := systray.AddMenuItem("Désinstaller…", "Tout supprimer (programme, réglages, démarrage auto)")
+	if isPortable() {
+		mUninstall.Hide() // rien d'installé : il suffit de supprimer le dossier
+	}
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quitter", "")
 

@@ -97,3 +97,27 @@ func TestSystemContext(t *testing.T) {
 		}
 	}
 }
+
+// Version portable : données à côté de l'exe, entrée de démarrage distincte, jamais d'installation.
+func TestPortableFlavor(t *testing.T) {
+	defer func(f string) { flavor = f }(flavor)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	flavor = ""
+	std := dataDir()
+	if filepath.Dir(std) == filepath.Dir(exe) || autostartValue() != runValue {
+		t.Fatal("version classique : données attendues dans le profil :", std)
+	}
+	flavor = "portable"
+	if got := dataDir(); got != filepath.Join(filepath.Dir(exe), "ImmichWallpaper-data") || got == std {
+		t.Fatal("version portable : données attendues à côté de l'exe :", got)
+	}
+	if autostartValue() == runValue {
+		t.Fatal("la version portable ne doit pas réutiliser l'entrée de démarrage de la version installée")
+	}
+	if maybeInstall() {
+		t.Fatal("la version portable ne doit jamais proposer l'installation")
+	}
+}

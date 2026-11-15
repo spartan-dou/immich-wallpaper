@@ -2,17 +2,42 @@
 
 Petite appli Windows (barre système) qui met en fond d'écran — et, en option, d'écran de verrouillage — des photos tirées d'un ou plusieurs albums [Immich](https://immich.app), avec le lieu et la date incrustés dans une carte façon verre dépoli. Un peu comme « Windows à la une », mais avec tes photos.
 
-**Téléchargement** : onglet [Releases](../../releases) → `ImmichWallpaper-x64.exe` (PC Intel/AMD) ou `ImmichWallpaper-arm64.exe` (Windows sur ARM).
+**Téléchargement** : onglet [Releases](../../releases), en deux versions, chacune pour PC Intel/AMD (`x64`) et Windows sur ARM (`arm64`) :
+
+| Version | Fichier | Pour qui |
+|---|---|---|
+| **Installeur** | `ImmichWallpaper-setup-x64.exe` / `-setup-arm64.exe` | Usage normal : s'installe, se lance avec Windows, se désinstalle depuis les paramètres de Windows. |
+| **Portable** | `ImmichWallpaper-portable-x64.exe` / `-portable-arm64.exe` | Sans installation : l'exe et ses données restent dans le dossier où tu le poses (clé USB, dossier personnel…). |
+
+Les fichiers `ImmichWallpaper-x64.exe` / `-arm64.exe` sont l'exe classique : c'est lui que la mise à jour automatique des copies installées télécharge. Lancé à la main, il propose de s'installer ou de tourner sans installation.
 
 ## Installation
 
-Deux versions natives : `ImmichWallpaper-x64.exe` (PC Intel/AMD) et `ImmichWallpaper-arm64.exe` (PC Snapdragon / Windows sur ARM). Dans le doute : *Paramètres → Système → Informations système → Type du système*.
+Architecture : `x64` pour un PC Intel/AMD, `arm64` pour un PC Snapdragon / Windows sur ARM. Dans le doute : *Paramètres → Système → Informations système → Type du système*.
 
-1. Lance `ImmichWallpaper.exe` (SmartScreen : *Informations complémentaires → Exécuter quand même*, exe non signé).
-2. Il propose de s'installer : copie dans `%LOCALAPPDATA%\Programs\ImmichWallpaper\`, raccourci dans le menu Démarrer, lancement avec Windows, entrée dans *Paramètres → Applications installées*. « Non » = mode portable.
+### Avec l'installeur
+
+1. Lance `ImmichWallpaper-setup-x64.exe` (SmartScreen : *Informations complémentaires → Exécuter quand même*, exe non signé).
+2. Confirme l'installation : copie dans `%LOCALAPPDATA%\Programs\ImmichWallpaper\`, raccourci dans le menu Démarrer, lancement avec Windows, entrée dans *Paramètres → Applications installées*. Aucun droit administrateur n'est nécessaire. « Non » annule.
 3. La page de réglages s'ouvre : URL + token → **Tester et charger les albums** → coche les albums → **Enregistrer**.
 
-**Mise à jour** : lance simplement le nouvel exe téléchargé, il propose de remplacer la version installée (il arrête l'ancienne lui-même, la config est conservée).
+Installation sans question (déploiement automatisé) : `ImmichWallpaper-setup-x64.exe --quiet`.
+
+**Mise à jour manuelle** : relance simplement un installeur plus récent, il remplace la version installée (il arrête l'ancienne lui-même, la config est conservée). Sinon, l'appli se met à jour seule (voir plus bas).
+
+### Version portable
+
+1. Pose `ImmichWallpaper-portable-x64.exe` dans un dossier où tu peux écrire, puis lance-le.
+2. La page de réglages s'ouvre, comme ci-dessus.
+
+Ce qui change par rapport à la version installée :
+
+- Les réglages, le journal, le cache et les images sont dans le dossier `ImmichWallpaper-data` à côté de l'exe ; rien n'est écrit dans `%APPDATA%`.
+- Rien n'est installé : ni raccourci, ni entrée dans les applications de Windows. Pour la retirer, quitte l'appli et supprime le dossier.
+- « Démarrer avec Windows » reste possible depuis le menu de l'icône (décoché par défaut) ; pense à le décocher avant de supprimer ou déplacer le dossier.
+- La mise à jour automatique remplace l'exe portable par la nouvelle version portable.
+- La clé API est chiffrée pour ton compte Windows sur ce PC : sur un autre PC ou un autre compte, il faut la ressaisir.
+- Une seule instance tourne à la fois : la version portable ne se lance pas si la version installée est déjà en cours d'exécution.
 
 ## Plusieurs écrans et mode hors ligne
 
@@ -81,7 +106,7 @@ Immich génère par défaut ses aperçus en Display P3 (profil ICC intégré). W
 
 ## Fichiers
 
-Tout est dans `%APPDATA%\ImmichWallpaper\` : `config.json` (éditable à la main aussi), `journal.txt` (1 Mo max, le précédent est gardé dans `journal.1.txt`), `recent.json` (photos affichées récemment, pour ne pas les revoir après un redémarrage), `excluded.json` (photos masquées), les dossiers `cache` (hors ligne) et `preload` (photo suivante) et les deux images `wallpaper_a/b.jpg`.
+Tout est dans `%APPDATA%\ImmichWallpaper\` (version portable : dans `ImmichWallpaper-data` à côté de l'exe) : `config.json` (éditable à la main aussi), `journal.txt` (1 Mo max, le précédent est gardé dans `journal.1.txt`), `recent.json` (photos affichées récemment, pour ne pas les revoir après un redémarrage), `excluded.json` (photos masquées), les dossiers `cache` (hors ligne) et `preload` (photo suivante) et les deux images `wallpaper_a/b.jpg`.
 
 ## Comportement
 
@@ -99,6 +124,7 @@ Go pur (pas de cgo), cross-compilable depuis n'importe quel OS :
 ```sh
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-H windowsgui -s -w" -o ImmichWallpaper-x64.exe .
 GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-H windowsgui -s -w" -o ImmichWallpaper-arm64.exe .
+# installeur ou version portable : ajouter -X main.flavor=setup (ou portable) aux ldflags
 go test ./...
 ```
 
@@ -126,6 +152,6 @@ Les fichiers `rsrc_windows_*.syso` contiennent l'icône et le manifeste (DPI, co
 
 ### Publier une version
 
-Change le numéro dans `version.go` (ex. `var appVersion = "1.5.0"`) et pousse sur `main` : la pipeline voit qu'aucune release `v1.5.0` n'existe, compile les deux exe, crée le tag et la release. Les applis installées se mettent à jour d'elles-mêmes dans les 24 h.
+Change le numéro dans `version.go` (ex. `var appVersion = "1.5.0"`) et pousse sur `main` : la pipeline voit qu'aucune release `v1.5.0` n'existe, compile les exe (classique, installeur et portable, en x64 et ARM64), crée le tag et la release. Les applis installées se mettent à jour d'elles-mêmes dans les 24 h.
 
 (Pousser un tag `vX.Y.Z` fonctionne aussi.) Les autres push sur `main` produisent seulement des exe de dev en artefacts. Une release existante n'est jamais écrasée ; chaque exe publié est accompagné d'une attestation de provenance (`gh attestation verify ImmichWallpaper-x64.exe --repo spartan-dou/immich-wallpaper`).

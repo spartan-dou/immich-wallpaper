@@ -26,6 +26,20 @@ func TestNewerVersion(t *testing.T) {
 	}
 }
 
+func TestAssetNameByFlavor(t *testing.T) {
+	defer func(f string) { flavor = f }(flavor)
+	for f, want := range map[string]string{"": "ImmichWallpaper-x64.exe", "setup": "ImmichWallpaper-x64.exe", "portable": "ImmichWallpaper-portable-x64.exe"} {
+		flavor = f
+		if got := assetName("amd64"); got != want {
+			t.Errorf("flavor %q : %s", f, got)
+		}
+	}
+	flavor = "portable"
+	if got := assetName("arm64"); got != "ImmichWallpaper-portable-arm64.exe" {
+		t.Error(got)
+	}
+}
+
 func TestCheckAndDownloadUpdate(t *testing.T) {
 	bin := append([]byte("MZ"), []byte(strings.Repeat("x", 1000))...)
 	sum := sha256.Sum256(bin)
