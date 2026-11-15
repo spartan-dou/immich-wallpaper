@@ -1,7 +1,7 @@
 package main
 
 // appVersion est remplacée au build par la pipeline (-X main.appVersion=1.5.0).
-var appVersion = "1.8.0"
+var appVersion = "1.9.0"
 
 // flavor distingue les exécutables publiés (-X main.flavor=…) :
 //   - ""         : exe classique, celui que la mise à jour automatique des copies installées télécharge ;
