@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"image"
 	"net/http"
 	"net/http/httptest"
@@ -235,9 +236,13 @@ func TestReapply(t *testing.T) {
 		t.Fatalf("%dx%d, photo %s, téléchargements %d→%d", ic.Width, ic.Height, core.lastPhotos[0].Asset.ID, before, downloads())
 	}
 
-	// Écran 32:9 branché : il faut 2 photos → nouveau tirage.
+	// Écran 32:9 branché : il faut 2 photos → Reapply le signale sans tirer lui-même
+	// (c'est l'appli qui décide, pour respecter la pause).
 	sc = Screen{W: 5120, H: 1440}
-	if _, err := core.Reapply(); err != nil {
+	if _, err := core.Reapply(); !errors.Is(err, errNeedDraw) || downloads() != before {
+		t.Fatal("errNeedDraw attendu sans téléchargement", err)
+	}
+	if _, err := core.Next(); err != nil {
 		t.Fatal(err)
 	}
 	if len(core.lastPhotos) != 2 || downloads() == before {

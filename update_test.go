@@ -51,6 +51,7 @@ func TestCheckAndDownloadUpdate(t *testing.T) {
 	}))
 	defer srv.Close()
 	updateAPI = srv.URL + "/latest"
+	updateAssetPrefix = srv.URL + "/"
 
 	if u, err := checkUpdate("1.5.0"); err != nil || u != nil {
 		t.Fatal("déjà à jour attendu", u, err)
@@ -69,5 +70,19 @@ func TestCheckAndDownloadUpdate(t *testing.T) {
 	}
 	if _, err := checkUpdate("dev-1234567"); err == nil {
 		t.Fatal("une version de dev ne doit pas se mettre à jour")
+	}
+	// Fichiers hébergés ailleurs que dans les releases du dépôt : refus.
+	updateAssetPrefix = "https://github.com/" + updateRepo + "/releases/download/"
+	if _, err := checkUpdate("1.4.0"); err == nil || !strings.Contains(err.Error(), "inattendue") {
+		t.Fatal("adresse de téléchargement étrangère acceptée", err)
+	}
+	for u, ok := range map[string]bool{
+		"https://release-assets.githubusercontent.com/x": true, "https://github.com/x": true,
+		"http://github.com/x": false, "https://evilgithub.com/x": false, "https://example.org/x": false,
+	} {
+		req, _ := http.NewRequest("GET", u, nil)
+		if err := checkUpdateRedirect(req, nil); (err == nil) != ok {
+			t.Errorf("redirection %s : %v", u, err)
+		}
 	}
 }

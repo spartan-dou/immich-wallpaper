@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"image"
 	"image/draw"
 	"math"
+	"runtime"
+	"sync"
 )
 
 // ---------- lecture des métadonnées (profil ICC, orientation EXIF) ----------
@@ -304,7 +307,7 @@ func toSRGB(src image.Image, p *iccProfile) *image.RGBA {
 		enc[i] = uint8(math.Round(srgbEncode(float64(i)/n) * 255))
 	}
 	q := func(x float64) uint8 {
-		if x <= 0 {
+		if !(x > 0) { // négatif ou NaN (profil ICC aberrant)
 			return 0
 		}
 		if x >= 1 {
@@ -313,16 +316,38 @@ func toSRGB(src image.Image, p *iccProfile) *image.RGBA {
 		return enc[int(x*n+0.5)]
 	}
 
+	dst := asRGBA(src, true)
+	// Conversion par bandes de lignes, une par cœur.
+	h := dst.Rect.Dy()
+	workers := max(1, min(runtime.NumCPU(), h/64))
+	var wg sync.WaitGroup
+	for k := 0; k < workers; k++ {
+		y0, y1 := h*k/workers, h*(k+1)/workers
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pix := dst.Pix[y0*dst.Stride : y1*dst.Stride]
+			for o := 0; o+3 < len(pix); o += 4 {
+				r, g, bl := lin[0][pix[o]], lin[1][pix[o+1]], lin[2][pix[o+2]]
+				pix[o] = q(t[0][0]*r + t[0][1]*g + t[0][2]*bl)
+				pix[o+1] = q(t[1][0]*r + t[1][1]*g + t[1][2]*bl)
+				pix[o+2] = q(t[2][0]*r + t[2][1]*g + t[2][2]*bl)
+			}
+		}()
+	}
+	wg.Wait()
+	return dst
+}
+
+// asRGBA renvoie l'image sous forme *image.RGBA d'origine (0,0). Si copy est faux et que
+// l'image a déjà cette forme, elle est renvoyée telle quelle (sans copie).
+func asRGBA(src image.Image, copy bool) *image.RGBA {
 	b := src.Bounds()
+	if r, ok := src.(*image.RGBA); ok && !copy && b.Min == (image.Point{}) && r.Stride == 4*b.Dx() {
+		return r
+	}
 	dst := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
 	draw.Draw(dst, dst.Bounds(), src, b.Min, draw.Src)
-	pix := dst.Pix
-	for o := 0; o+3 < len(pix); o += 4 {
-		r, g, bl := lin[0][pix[o]], lin[1][pix[o+1]], lin[2][pix[o+2]]
-		pix[o] = q(t[0][0]*r + t[0][1]*g + t[0][2]*bl)
-		pix[o+1] = q(t[1][0]*r + t[1][1]*g + t[1][2]*bl)
-		pix[o+2] = q(t[2][0]*r + t[2][1]*g + t[2][2]*bl)
-	}
 	return dst
 }
 
@@ -333,14 +358,16 @@ func orient(src image.Image, o int) image.Image {
 	if o <= 1 || o > 8 {
 		return src
 	}
-	b := src.Bounds()
-	w, h := b.Dx(), b.Dy()
+	// Accès direct aux octets (4 par pixel) : bien plus rapide que At/Set pixel par pixel.
+	s := asRGBA(src, false)
+	w, h := s.Rect.Dx(), s.Rect.Dy()
 	dw, dh := w, h
 	if o >= 5 {
 		dw, dh = h, w
 	}
 	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
 	for y := 0; y < h; y++ {
+		row := s.Pix[y*s.Stride : y*s.Stride+4*w]
 		for x := 0; x < w; x++ {
 			var dx, dy int
 			switch o {
@@ -359,42 +386,59 @@ func orient(src image.Image, o int) image.Image {
 			case 8:
 				dx, dy = y, w-1-x
 			}
-			dst.Set(dx, dy, src.At(b.Min.X+x, b.Min.Y+y))
+			di := dy*dst.Stride + 4*dx
+			copy(dst.Pix[di:di+4], row[4*x:4*x+4])
 		}
 	}
 	return dst
 }
 
-// decodeNormalized décode l'image, la redresse selon l'EXIF et la convertit en sRGB.
-// changed=false si l'octet-à-octet d'origine peut être conservé tel quel (JPEG sRGB, non tourné).
-func decodeNormalized(data []byte) (img image.Image, format string, changed bool, err error) {
-	img, format, err = image.Decode(bytes.NewReader(data))
-	if err != nil {
-		return nil, "", false, err
-	}
-	var icc []byte
-	orientation := 1
-	switch format {
-	case "jpeg":
-		icc, orientation = jpegMeta(data)
-	case "webp":
-		icc = webpICC(data)
-	}
-	if p, ok := parseICC(icc); ok && !p.isSRGB() {
-		img = toSRGB(img, p)
-		changed = true
-	}
-	if orientation > 1 {
-		img = orient(img, orientation)
-		changed = true
-	}
-	return img, format, changed || format != "jpeg", nil
+// ---------- lecture d'une image téléchargée ----------
+
+// Au-delà, l'image est refusée avant décodage (120 Mpx en RGBA = 480 Mo).
+const maxPixels = 120_000_000
+
+// imageMeta : ce qu'on sait d'une image à partir de son seul en-tête.
+type imageMeta struct {
+	W, H        int // dimensions affichées (orientation EXIF appliquée)
+	format      string
+	icc         []byte
+	orientation int
 }
 
-// orientedSize renvoie les dimensions affichées (en tenant compte de l'EXIF).
-func orientedSize(data []byte, w, h int) (int, int) {
-	if _, o := jpegMeta(data); o >= 5 {
-		return h, w
+// probeImage lit l'en-tête (dimensions, profil ICC, orientation EXIF) sans décoder les pixels.
+func probeImage(data []byte) (imageMeta, error) {
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return imageMeta{}, fmt.Errorf("format non pris en charge (HEIC/RAW ? utilise image_size=fullsize) : %w", err)
 	}
-	return w, h
+	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxPixels {
+		return imageMeta{}, fmt.Errorf("dimensions refusées (%d × %d, maximum %d Mpx)", cfg.Width, cfg.Height, maxPixels/1_000_000)
+	}
+	m := imageMeta{W: cfg.Width, H: cfg.Height, format: format, orientation: 1}
+	switch format {
+	case "jpeg":
+		m.icc, m.orientation = jpegMeta(data)
+	case "webp":
+		m.icc = webpICC(data)
+	}
+	if m.orientation >= 5 {
+		m.W, m.H = m.H, m.W
+	}
+	return m, nil
+}
+
+// decode décode l'image, la convertit en sRGB et la redresse selon l'EXIF.
+func (m imageMeta) decode(data []byte) (image.Image, error) {
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	if p, ok := parseICC(m.icc); ok && !p.isSRGB() {
+		img = toSRGB(img, p)
+	}
+	if m.orientation > 1 {
+		img = orient(img, m.orientation)
+	}
+	return img, nil
 }

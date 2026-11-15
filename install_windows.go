@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -73,13 +75,20 @@ func hiddenCmd(name string, args ...string) *exec.Cmd {
 
 func pidFile() string { return filepath.Join(dataDir(), "instance.pid") }
 
-func writePID() { os.WriteFile(pidFile(), []byte(strconv.Itoa(os.Getpid())), 0o644) }
+func writePID() {
+	if err := os.WriteFile(pidFile(), []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		log.Printf("fichier PID : %v", err)
+	}
+}
 
 // stopRunningInstance termine l'autre instance (vérifie que le PID est bien Immich Wallpaper).
 func stopRunningInstance() {
 	stopByPID()
-	// Filet de sécurité (anciennes versions sans fichier PID) : toute autre instance du même nom.
-	hiddenCmd("taskkill", "/F", "/IM", "ImmichWallpaper*", "/FI", "PID ne "+strconv.Itoa(os.Getpid())).Run()
+	// Filet de sécurité (anciennes versions sans fichier PID) : toute autre instance portant
+	// exactement l'un des noms distribués (pas de motif, pour ne viser aucun autre programme).
+	for _, name := range []string{"ImmichWallpaper.exe", "ImmichWallpaper-x64.exe", "ImmichWallpaper-arm64.exe"} {
+		hiddenCmd(systemExe("", "taskkill.exe"), "/F", "/IM", name, "/FI", "PID ne "+strconv.Itoa(os.Getpid())).Run()
+	}
 	time.Sleep(300 * time.Millisecond)
 }
 
@@ -121,11 +130,17 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
+	_, err = io.Copy(out, in)
+	if err == nil {
+		err = out.Sync()
+	}
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp)
 		return err
 	}
-	out.Close()
 	return os.Rename(tmp, dst)
 }
 
@@ -158,23 +173,31 @@ func install() error {
 	if st, err := os.Stat(dst); err == nil {
 		size = uint32(st.Size() / 1024)
 	}
-	k.SetStringValue("DisplayName", "Immich Wallpaper")
-	k.SetStringValue("DisplayVersion", appVersion)
-	k.SetStringValue("Publisher", "Immich Wallpaper")
-	k.SetStringValue("DisplayIcon", dst)
-	k.SetStringValue("InstallLocation", installDir())
-	k.SetStringValue("UninstallString", `"`+dst+`" --uninstall`)
-	k.SetStringValue("QuietUninstallString", `"`+dst+`" --uninstall --quiet`)
-	k.SetDWordValue("NoModify", 1)
-	k.SetDWordValue("NoRepair", 1)
-	k.SetDWordValue("EstimatedSize", size)
+	err = errors.Join(
+		k.SetStringValue("DisplayName", "Immich Wallpaper"),
+		k.SetStringValue("DisplayVersion", appVersion),
+		k.SetStringValue("Publisher", "Immich Wallpaper"),
+		k.SetStringValue("DisplayIcon", dst),
+		k.SetStringValue("InstallLocation", installDir()),
+		k.SetStringValue("UninstallString", `"`+dst+`" --uninstall`),
+		k.SetStringValue("QuietUninstallString", `"`+dst+`" --uninstall --quiet`),
+		k.SetDWordValue("NoModify", 1),
+		k.SetDWordValue("NoRepair", 1),
+		k.SetDWordValue("EstimatedSize", size),
+	)
 	k.Close()
+	if err != nil {
+		return fmt.Errorf("entrée « Applications installées » : %w", err)
+	}
 
 	// Raccourci menu Démarrer + démarrage automatique (pointant vers la copie installée).
 	ps := `$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:IW_LNK);$s.TargetPath=$env:IW_EXE;$s.WorkingDirectory=$env:IW_DIR;$s.Save()`
-	cmd := hiddenCmd("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps)
+	cmd := hiddenCmd(powershellExe(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps)
 	cmd.Env = append(os.Environ(), "IW_LNK="+startMenuShortcut(), "IW_EXE="+dst, "IW_DIR="+installDir())
-	cmd.Run()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// Non bloquant : l'appli reste installée et lancée au démarrage, sans raccourci.
+		msgBox("Immich Wallpaper", "Raccourci du menu Démarrer non créé :\n"+err.Error()+"\n"+strings.TrimSpace(string(out)), mbIconInfo)
+	}
 
 	return setAutostartPath(dst)
 }
@@ -246,12 +269,23 @@ func uninstall(quiet bool) {
 	if !quiet {
 		msgBox("Immich Wallpaper", "Immich Wallpaper a été désinstallé.", mbIconInfo)
 	}
-	cmd := exec.Command("cmd.exe")
+	// Garde-fou : la ligne ci-dessous supprime un dossier entier ; on n'accepte que le dossier
+	// d'installation attendu, sans caractère interprété par cmd.
+	if filepath.Base(target) != "ImmichWallpaper" || !filepath.IsAbs(target) || strings.ContainsAny(target, `"%&|<>^`) {
+		return
+	}
+	cmd := exec.Command(systemExe("", "cmd.exe"))
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000,
 		// Ligne de commande brute : cmd ne comprend pas l'échappement \" que ferait Go.
-		CmdLine: fmt.Sprintf(`cmd.exe /c ping -n 4 127.0.0.1 >nul & rd /s /q "%s"`, target),
+		// /s /c "…" : cmd retire seulement les guillemets extérieurs, ceux des chemins sont conservés.
+		CmdLine: uninstallCmdLine(systemExe("", "ping.exe"), target),
 	}
 	cmd.Start()
+}
+
+// uninstallCmdLine : attend ~3 s (le temps que ce processus se termine) puis supprime le dossier.
+func uninstallCmdLine(ping, target string) string {
+	return fmt.Sprintf(`cmd.exe /s /c ""%s" -n 4 127.0.0.1 >nul & rd /s /q "%s""`, ping, target)
 }

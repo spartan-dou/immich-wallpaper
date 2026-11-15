@@ -19,6 +19,13 @@ const (
 	alb1 = "11111111-1111-1111-1111-111111111111"
 	alb2 = "22222222-2222-2222-2222-222222222222"
 	key  = "secret-token"
+
+	// Identifiants d'assets du faux serveur (Immich utilise des UUID ; tout autre format est refusé).
+	p1 = "aaaaaaaa-0000-4000-8000-000000000001" // portrait
+	l1 = "aaaaaaaa-0000-4000-8000-000000000002" // paysage (PNG)
+	l2 = "aaaaaaaa-0000-4000-8000-000000000003" // paysage (JPEG)
+	v1 = "aaaaaaaa-0000-4000-8000-000000000004" // vidéo
+	t1 = "aaaaaaaa-0000-4000-8000-000000000005" // corbeille
 )
 
 func mkImg(w, h int, format string) []byte {
@@ -48,9 +55,10 @@ func fakeImmich(t *testing.T) *httptest.Server {
 			json.NewEncoder(w).Encode([]map[string]any{{"id": alb1, "albumName": "Finlande", "assetCount": 3}, {"id": alb2, "albumName": "Bassin", "assetCount": 2}})
 		case r.URL.Path == "/api/albums/"+alb1:
 			json.NewEncoder(w).Encode(map[string]any{"albumName": "Finlande", "assetCount": 3, "assets": []map[string]any{
-				{"id": "p1", "type": "IMAGE", "originalFileName": "portrait.jpg"},
-				{"id": "v1", "type": "VIDEO"},
-				{"id": "t1", "type": "IMAGE", "isTrashed": true},
+				{"id": p1, "type": "IMAGE", "originalFileName": "portrait.jpg"},
+				{"id": v1, "type": "VIDEO"},
+				{"id": t1, "type": "IMAGE", "isTrashed": true},
+				{"id": `..\config`, "type": "IMAGE", "originalFileName": "piege.jpg"}, // identifiant non UUID : ignoré
 			}})
 		case r.URL.Path == "/api/albums/"+alb2:
 			json.NewEncoder(w).Encode(map[string]any{"albumName": "Bassin", "assetCount": 2})
@@ -58,26 +66,26 @@ func fakeImmich(t *testing.T) *httptest.Server {
 			var body struct{ Page int }
 			json.NewDecoder(r.Body).Decode(&body)
 			if body.Page == 1 {
-				json.NewEncoder(w).Encode(map[string]any{"assets": map[string]any{"items": []map[string]any{{"id": "l1", "type": "IMAGE", "originalFileName": "paysage.png"}}, "nextPage": "2"}})
+				json.NewEncoder(w).Encode(map[string]any{"assets": map[string]any{"items": []map[string]any{{"id": l1, "type": "IMAGE", "originalFileName": "paysage.png"}}, "nextPage": "2"}})
 			} else {
-				json.NewEncoder(w).Encode(map[string]any{"assets": map[string]any{"items": []map[string]any{{"id": "l2", "type": "IMAGE", "originalFileName": "paysage2.jpg"}}, "nextPage": nil}})
+				json.NewEncoder(w).Encode(map[string]any{"assets": map[string]any{"items": []map[string]any{{"id": l2, "type": "IMAGE", "originalFileName": "paysage2.jpg"}}, "nextPage": nil}})
 			}
-		case r.URL.Path == "/api/assets/l2" || r.URL.Path == "/api/assets/l1":
+		case r.URL.Path == "/api/assets/"+l2 || r.URL.Path == "/api/assets/"+l1:
 			json.NewEncoder(w).Encode(map[string]any{"localDateTime": "2025-03-14T10:00:00.000Z",
 				"exifInfo": map[string]any{"city": "Rovaniemi", "state": "Laponie", "country": "Finlande"}})
-		case r.URL.Path == "/api/assets/p1/thumbnail":
+		case r.URL.Path == "/api/assets/"+p1+"/thumbnail":
 			w.Write(mkImg(30, 60, "jpeg"))
-		case r.URL.Path == "/api/assets/l1/thumbnail":
+		case r.URL.Path == "/api/assets/"+l1+"/thumbnail":
 			if r.URL.Query().Get("size") == "fullsize" {
 				w.WriteHeader(404) // simule un vieux Immich sans fullsize
 				return
 			}
 			w.Write(mkImg(80, 40, "png"))
-		case r.URL.Path == "/api/assets/l2/thumbnail" && r.URL.Query().Get("size") == "fullsize":
+		case r.URL.Path == "/api/assets/"+l2+"/thumbnail" && r.URL.Query().Get("size") == "fullsize":
 			http.Redirect(w, r, "original?c=1", http.StatusFound) // comme Immich sans fullsize généré
-		case r.URL.Path == "/api/assets/l2/original":
+		case r.URL.Path == "/api/assets/"+l2+"/original":
 			w.WriteHeader(403) // token sans asset.download
-		case r.URL.Path == "/api/assets/l2/thumbnail":
+		case r.URL.Path == "/api/assets/"+l2+"/thumbnail":
 			w.Write(mkImg(80, 40, "jpeg"))
 		default:
 			t.Logf("404 %s", r.URL)
@@ -111,12 +119,12 @@ func TestCoreNext(t *testing.T) {
 			t.Fatal(err)
 		}
 		a := r.Asset
-		if a.ID == "p1" {
+		if a.ID == p1 {
 			t.Fatal("portrait choisi alors que landscape_only")
 		}
 		seen[a.ID] = true
 	}
-	if !seen["l1"] || !seen["l2"] || len(core.assets) != 3 {
+	if !seen[l1] || !seen[l2] || len(core.assets) != 3 {
 		t.Fatalf("seen=%v assets=%d", seen, len(core.assets))
 	}
 	b, _ := os.ReadFile(applied[len(applied)-1])
@@ -140,7 +148,7 @@ func TestPortraitFallback(t *testing.T) {
 	cfg.normalize()
 	core.SetConfig(cfg)
 	r, err := core.Next()
-	if err != nil || r.Asset.ID != "p1" {
+	if err != nil || r.Asset.ID != p1 {
 		t.Fatal(r, err)
 	}
 }
@@ -206,6 +214,36 @@ func TestSettingsServer(t *testing.T) {
 	code, _, _ = post("api/save", map[string]any{"server_url": srv.URL, "albums": []string{}})
 	if code != 400 {
 		t.Fatal("save sans album accepté")
+	}
+
+	// Le token enregistré n'est jamais envoyé à un autre serveur que le sien.
+	leaked := false
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked = leaked || r.Header.Get("x-api-key") == key
+		w.Write([]byte("[]"))
+	}))
+	defer other.Close()
+	for _, route := range []string{"api/albums", "api/save"} {
+		code, m, _ = post(route, map[string]any{"server_url": other.URL, "api_key": "", "albums": []string{alb1}})
+		if code != 400 || leaked {
+			t.Fatalf("%s : token réutilisé pour un autre serveur (code %d, fuite %v, %v)", route, code, leaked, m)
+		}
+	}
+
+	// Durcissements : Host inattendu, méthode et type de contenu des routes d'action.
+	req, _ := http.NewRequest("GET", s.URL(), nil)
+	req.Host = "evil.example"
+	if r, err := http.DefaultClient.Do(req); err != nil || r.StatusCode != 403 {
+		t.Fatal("Host étranger accepté", err)
+	}
+	if r, _ := http.Get(s.URL() + "api/next"); r.StatusCode != 405 {
+		t.Fatal("api/next accepté en GET", r.StatusCode)
+	}
+	if r, _ := http.Post(s.URL()+"api/next", "text/plain", strings.NewReader("{}")); r.StatusCode != 415 {
+		t.Fatal("api/next accepté sans JSON", r.StatusCode)
+	}
+	if r, _ := http.Get(s.URL()); r.Header.Get("Content-Security-Policy") == "" || r.Header.Get("Cache-Control") != "no-store" {
+		t.Fatal("en-têtes de sécurité absents")
 	}
 }
 

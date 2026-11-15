@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -35,9 +39,11 @@ func setWallpaper(path, style string) error {
 	}
 	k, _, err := registry.CreateKey(registry.CURRENT_USER, `Control Panel\Desktop`, registry.SET_VALUE)
 	if err == nil {
-		k.SetStringValue("WallpaperStyle", ws)
-		k.SetStringValue("TileWallpaper", tile)
+		err = errors.Join(k.SetStringValue("WallpaperStyle", ws), k.SetStringValue("TileWallpaper", tile))
 		k.Close()
+	}
+	if err != nil {
+		log.Printf("style du fond d'écran (registre) : %v", err)
 	}
 	setBackgroundTypePicture()
 	p, err := windows.UTF16PtrFromString(path)
@@ -59,8 +65,58 @@ func msgBox(title, text string, flags uintptr) {
 
 func shellOpen(target string) {
 	verb, _ := windows.UTF16PtrFromString("open")
-	t, _ := windows.UTF16PtrFromString(target)
-	windows.ShellExecute(0, verb, t, nil, nil, windows.SW_SHOWNORMAL)
+	t, err := windows.UTF16PtrFromString(target)
+	if err == nil {
+		err = windows.ShellExecute(0, verb, t, nil, nil, windows.SW_SHOWNORMAL)
+	}
+	if err != nil {
+		log.Printf("ouverture impossible : %v", err)
+	}
+}
+
+// systemExe renvoie le chemin absolu d'un programme de Windows (System32), pour ne pas
+// dépendre du PATH. sub : sous-dossier éventuel (ex. WindowsPowerShell\v1.0).
+func systemExe(sub, name string) string {
+	dir, err := windows.GetSystemDirectory()
+	if err != nil {
+		dir = filepath.Join(os.Getenv("SystemRoot"), "System32")
+	}
+	return filepath.Join(dir, sub, name)
+}
+
+func powershellExe() string { return systemExe(`WindowsPowerShell\v1.0`, "powershell.exe") }
+
+// ---------- clé API chiffrée (DPAPI) ----------
+
+// protectSecret chiffre la valeur pour le compte Windows courant ; ok=false si impossible
+// (la valeur est alors enregistrée en clair, comme avant).
+func protectSecret(s string) (string, bool) {
+	if s == "" {
+		return "", false
+	}
+	b := []byte(s)
+	in := windows.DataBlob{Size: uint32(len(b)), Data: &b[0]}
+	var out windows.DataBlob
+	if err := windows.CryptProtectData(&in, nil, nil, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN, &out); err != nil {
+		log.Printf("chiffrement de la clé API impossible, enregistrée en clair : %v", err)
+		return "", false
+	}
+	defer windows.LocalFree(windows.Handle(unsafe.Pointer(out.Data)))
+	return base64.StdEncoding.EncodeToString(unsafe.Slice(out.Data, out.Size)), true
+}
+
+func unprotectSecret(enc string) (string, error) {
+	b, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil || len(b) == 0 {
+		return "", errors.New("valeur chiffrée illisible")
+	}
+	in := windows.DataBlob{Size: uint32(len(b)), Data: &b[0]}
+	var out windows.DataBlob
+	if err := windows.CryptUnprotectData(&in, nil, nil, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN, &out); err != nil {
+		return "", err
+	}
+	defer windows.LocalFree(windows.Handle(unsafe.Pointer(out.Data)))
+	return string(unsafe.Slice(out.Data, out.Size)), nil
 }
 
 func autostartEnabled() bool {
@@ -157,7 +213,7 @@ $t2.Wait(-1) | Out-Null
 func setLockScreen(path string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", lockScreenPS)
+	cmd := exec.CommandContext(ctx, powershellExe(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", lockScreenPS)
 	cmd.Env = append(os.Environ(), "IW_LOCK_PATH="+path)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000 /* CREATE_NO_WINDOW */}
 	out, err := cmd.CombinedOutput()
@@ -190,9 +246,14 @@ func updateDesktopLink(cfg *Config, a Asset, webURL string) {
 		os.Remove(path)
 		return
 	}
+	if strings.ContainsAny(webURL, "\r\n") { // fichier INI : jamais de retour à la ligne injecté
+		return
+	}
 	exe, _ := os.Executable()
 	content := "[InternetShortcut]\r\nURL=" + webURL + "\r\nIconFile=" + exe + "\r\nIconIndex=0\r\n"
-	os.WriteFile(path, []byte(content), 0o644)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		log.Printf("raccourci du bureau : %v", err)
+	}
 }
 
 func removeDesktopLink() { os.Remove(desktopLinkPath()) }
@@ -206,6 +267,8 @@ func setBackgroundTypePicture() {
 	}
 	defer k.Close()
 	if v, _, err := k.GetIntegerValue("BackgroundType"); err == nil && v != 0 {
-		k.SetDWordValue("BackgroundType", 0)
+		if err := k.SetDWordValue("BackgroundType", 0); err != nil {
+			log.Printf("arrière-plan en mode « Image » : %v", err)
+		}
 	}
 }

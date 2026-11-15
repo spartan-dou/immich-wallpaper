@@ -19,7 +19,24 @@ import (
 // Dépôt GitHub (public) dont les releases servent aux mises à jour.
 const updateRepo = "spartan-dou/immich-wallpaper"
 
-var updateAPI = "https://api.github.com/repos/" + updateRepo + "/releases/latest"
+var (
+	updateAPI = "https://api.github.com/repos/" + updateRepo + "/releases/latest"
+	// Seuls les fichiers de release de ce dépôt sont téléchargés (variable : remplacée dans les tests).
+	updateAssetPrefix = "https://github.com/" + updateRepo + "/releases/download/"
+)
+
+// checkUpdateRedirect : GitHub redirige les fichiers de release vers son stockage ;
+// toute redirection hors HTTPS ou hors de ses domaines est refusée.
+func checkUpdateRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("trop de redirections")
+	}
+	h := req.URL.Hostname()
+	if req.URL.Scheme != "https" || !(h == "github.com" || strings.HasSuffix(h, ".github.com") || strings.HasSuffix(h, ".githubusercontent.com")) {
+		return fmt.Errorf("redirection refusée vers %s://%s", req.URL.Scheme, h)
+	}
+	return nil
+}
 
 type ghRelease struct {
 	TagName    string `json:"tag_name"`
@@ -78,7 +95,7 @@ type Update struct {
 	name    string
 }
 
-var updateHTTP = &http.Client{Timeout: 5 * time.Minute}
+var updateHTTP = &http.Client{Timeout: 5 * time.Minute, CheckRedirect: checkUpdateRedirect}
 
 func ghGet(url string) (*http.Response, error) {
 	req, err := http.NewRequest("GET", url, nil)
@@ -127,6 +144,11 @@ func checkUpdate(current string) (*Update, error) {
 	if u.exeURL == "" || u.sumsURL == "" {
 		return nil, fmt.Errorf("release %s incomplète (exe ou SHA256SUMS.txt manquant)", rel.TagName)
 	}
+	for _, link := range []string{u.exeURL, u.sumsURL} {
+		if !strings.HasPrefix(link, updateAssetPrefix) {
+			return nil, fmt.Errorf("release %s : adresse de téléchargement inattendue (%s)", rel.TagName, link)
+		}
+	}
 	return u, nil
 }
 
@@ -136,8 +158,11 @@ func (u *Update) Download() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	sums, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	sums, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
 	want := ""
 	sc := bufio.NewScanner(bytes.NewReader(sums))
 	for sc.Scan() {

@@ -271,3 +271,41 @@ Classées par rapport valeur/effort estimé.
 - Mise à jour : refus des versions antérieures ou égales, des brouillons et préversions (`update.go:115`), retour arrière automatique (`update_windows.go:84-113`).
 - Instance unique par mutex nommé `Local\` (`win_windows.go:99-110`), vérification du nom d'image avant de terminer un PID (`install_windows.go:102-104`).
 - Analyseurs `jpegMeta`, `exifOrientation`, `webpICC`, `parseICC` : contrôles de bornes présents sur tous les accès relus (cibles 64 bits) ; seul le cas `NaN` de S4 a été identifié.
+
+---
+
+## Suivi — correctifs appliqués
+
+État après application des recommandations (tests : `go test ./...` sous Linux et Windows ARM64, `go vet` Windows x64/ARM64, `staticcheck`, `govulncheck`, fuzzing court ; `go test -race` n'a pas pu être lancé en local — pas de compilateur C — et tourne en CI).
+
+| Constat | État | Détail |
+|---|---|---|
+| P1 | Appliqué | Portraits écartés ni décodés, ni enrichis, ni mis en cache ; au plus *n* gardés compressés en secours. Hors ligne, les paysages du cache passent d'abord. Le filtrage avant téléchargement (hypothèse `exifInfo`) n'est pas fait. |
+| P2 | Appliqué | Traitement écran par écran ; seules les versions JPEG réduites sont conservées entre deux écrans. |
+| P3 | Appliqué | Une seule réduction/encodage par photo (cache + photos mémorisées), en `BiLinear` ; les photos du cache ne sont plus réencodées. |
+| P4 | Appliqué | Verrou d'état court, distinct du verrou des opérations longues ; réseau, rendu et PowerShell hors verrou. |
+| P5 | Appliqué | `orient()` par accès direct aux octets ; `toSRGB` par bandes parallèles. |
+| P6 | Partiel | Album inaccessible retiré du tirage et journalisé. `withoutAssets` non appliqué (hypothèse non vérifiée, compatibilité avec les anciennes versions d'Immich). |
+| P7 | Appliqué | Minuteur réarmé sur l'échéance (plafonné à 1 min pour rester correct après une veille) ; requêtes avec `context`, annulées au changement de configuration ; délais distincts (en-têtes 2 min, téléchargement 15 min). |
+| S1 | Partiel | Adresse des fichiers et redirections contrôlées (releases GitHub du dépôt uniquement). **Signature des releases non faite** : elle demande une clé privée détenue hors du dépôt. Le défaut « installer » est inchangé. |
+| S2 | Appliqué | Jobs séparés (`contents: read` partout sauf `release`), actions épinglées par SHA, Go fixé par `go.mod`, plus de `--clobber`, attestation de provenance. L'approbation manuelle (*environment*) reste à activer dans les réglages du dépôt. |
+| S3 | Appliqué | `x/image` 0.48, `x/sys` 0.50, `x/text` 0.44 ; `govulncheck` en CI ; Dependabot (`gomod`, `github-actions`). |
+| S4 | Appliqué | `recover` autour du décodage, de `Next`/`Reapply` et des goroutines de l'appli ; plafond de 120 Mpx ; `NaN` traité ; tests de fuzzing. |
+| S5 | Appliqué | La clé enregistrée n'est réutilisée que pour le serveur enregistré. |
+| S6 | Appliqué | Clé chiffrée par DPAPI (`api_key_protected`), migration automatique d'une clé en clair. |
+| S7 | Appliqué | Certificat épinglé (empreinte SHA-256 relevée au test) à la place de l'acceptation aveugle ; avertissement `http://` hors réseau local. |
+| S8 | Appliqué | Identifiants d'assets limités aux UUID ; `server_url` validé par `url.Parse`. |
+| S9 | Partiel | Contrôle de `Host`, POST + JSON exigés, corps borné, délais, en-têtes de sécurité, erreur de `rand.Read` traitée. L'échange du jeton d'URL contre un cookie n'est pas fait. |
+| S10 | Appliqué | Chemins absolus `System32` ; `taskkill` limité aux trois noms d'exécutable distribués (conservé pour les anciennes versions sans fichier PID). |
+| D1 | Appliqué | « Étendre » conservé à l'application ; « Centrer » et « Mosaïque » rendus par `compose` ; un test par style. |
+| D2 | Appliqué | `Reapply` renvoie `errNeedDraw` ; l'appli décide (pause respectée) et passe par `change()`. |
+| D3 | Partiel | Écriture dans `.new` + `Sync` + renommages. Pas de restauration au démarrage (si l'exe est absent, rien ne se lance). |
+| D4 | Non fait | Découpage en paquets et horloge injectable : refonte à part. |
+| D5 | Appliqué | CI : tests sous Windows, `-race`, `staticcheck`, `govulncheck`, fuzzing. Tests de planification non faits (dépend de D4). |
+| D6 | Appliqué | Erreurs journalisées (dossier de données, registre, raccourcis, cache, COM). |
+| D7 | Appliqué | Rotation `journal.txt` → `journal.1.txt`, vérifiée à chaque écriture. |
+| D8 | Appliqué | Temporisation 2 → 30 min ; 401 (clé) distingué de 403 (ressource ignorée). |
+| D9 | Appliqué | README corrigé. |
+| D10 | Partiel | `max` masqué, double lecture des métadonnées, chemin des polices, historique `recent` persistant, `go.mod` aligné. Non faits : valeurs par défaut dupliquées dans la page, génération des `.syso` en CI. |
+
+Les idées de fonctionnalités (section 4) ne sont pas traitées ici.

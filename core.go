@@ -21,13 +21,18 @@ import (
 	_ "image/gif"
 	_ "image/png"
 
+	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
 
 // Fréquence de vérification des albums (une requête légère ; le contenu n'est rechargé que s'il a changé).
 const albumCheckEvery = 30 * time.Minute
 
-var errNotLandscape = errors.New("image en portrait")
+// Côté maximal des photos gardées (cache hors ligne, photos affichées).
+const keptMaxSide = 3840
+
+// errNeedDraw : Reapply ne peut pas couvrir les écrans actuels avec les photos mémorisées.
+var errNeedDraw = errors.New("pas assez de photos mémorisées pour les écrans actuels")
 
 // Monitor est un écran cible (mode « une image par écran »). ID = chemin de périphérique Windows.
 type Monitor struct {
@@ -40,6 +45,7 @@ type Photo struct {
 	Asset Asset
 	Img   image.Image
 	Info  AssetInfo
+	jpg   []byte // version réduite (keptMaxSide) encodée en JPEG
 }
 
 // keptPhoto : photo affichée, gardée en JPEG (≈10× plus léger que l'image décodée).
@@ -57,21 +63,29 @@ type albumState struct {
 
 // Core contient la logique indépendante de Windows (testable sous Linux).
 type Core struct {
+	// run sérialise les opérations longues (Next, Reapply : réseau, rendu, PowerShell).
+	// flip et fonts ne sont utilisés que sous ce verrou.
+	run   sync.Mutex
+	flip  bool
+	fonts *Fonts
+
+	// mu protège l'état ci-dessous ; il n'est jamais tenu pendant une entrée/sortie,
+	// pour que le menu et la page de réglages ne soient pas bloqués par un tirage.
 	mu            sync.Mutex
 	cfg           *Config
 	client        *Client
+	gen           int // incrémenté à chaque changement de configuration
 	albums        map[string]*albumState
 	albumsChecked time.Time
 	assets        []Asset
 	recent        []string
 	rnd           *rand.Rand
-	dir           string
-	flip          bool
 	last          Asset
 	lastOK        bool
 	lockErr       error
-	fonts         *Fonts
 	lastPhotos    []keptPhoto // photos affichées (compressées), réutilisées si les écrans changent
+
+	dir string
 
 	// Fonctions fournies par la plateforme (Windows) ; remplacées par des faux dans les tests.
 	setWallpaper         func(path, style string) error
@@ -83,24 +97,39 @@ type Core struct {
 }
 
 func newCore(dir string, setWallpaper func(path, style string) error) *Core {
-	return &Core{
+	c := &Core{
 		dir:          dir,
 		setWallpaper: setWallpaper,
 		albums:       map[string]*albumState{},
 		rnd:          rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
+	// Historique des photos récentes : conservé d'un lancement à l'autre.
+	if b, err := os.ReadFile(c.recentPath()); err == nil {
+		var ids []string
+		if json.Unmarshal(b, &ids) == nil && len(ids) <= 500 {
+			c.recent = ids
+		}
+	}
+	return c
 }
+
+func (c *Core) recentPath() string { return filepath.Join(c.dir, "recent.json") }
 
 func (c *Core) SetConfig(cfg *Config) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	old := c.client
 	if c.cfg == nil || c.cfg.ServerURL != cfg.ServerURL || c.cfg.APIKey != cfg.APIKey {
 		c.albums = map[string]*albumState{} // autre serveur ou autre compte : on repart de zéro
 	}
 	c.cfg = cfg
 	c.client = newClient(cfg)
+	c.gen++
 	c.assets = nil
 	c.albumsChecked = time.Time{}
+	c.mu.Unlock()
+	if old != nil {
+		old.Close() // annule les requêtes en cours de l'ancienne configuration
+	}
 }
 
 // LockError renvoie la dernière erreur de l'écran de verrouillage (nil si OK).
@@ -108,14 +137,6 @@ func (c *Core) LockError() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lockErr
-}
-
-func (c *Core) InvalidateAlbums() {
-	c.mu.Lock()
-	c.albums = map[string]*albumState{}
-	c.assets = nil
-	c.albumsChecked = time.Time{}
-	c.mu.Unlock()
 }
 
 func (c *Core) Last() (Asset, string, bool) {
@@ -127,67 +148,107 @@ func (c *Core) Last() (Asset, string, bool) {
 	return c.last, c.client.WebURL(c.last.ID), true
 }
 
+// job : une opération longue, avec la configuration figée à son démarrage.
+type job struct {
+	c      *Core
+	cfg    *Config
+	client *Client
+	gen    int
+}
+
+func (c *Core) begin() (*job, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg == nil {
+		return nil, errors.New("configuration incomplète : ouvre les paramètres")
+	}
+	return &job{c: c, cfg: c.cfg, client: c.client, gen: c.gen}, nil
+}
+
 // ---------- albums (rechargement incrémental) ----------
 
 // refreshAlbums interroge la liste des albums (une requête) et ne recharge le contenu
 // que des albums dont la signature (nombre de photos, dates de modification) a changé.
-func (c *Core) refreshAlbums() error {
-	if c.assets != nil && time.Since(c.albumsChecked) < albumCheckEvery {
-		return nil
+// Renvoie la liste des images à utiliser pour ce tirage.
+func (j *job) refreshAlbums() ([]Asset, error) {
+	c := j.c
+	c.mu.Lock()
+	assets, checked := c.assets, c.albumsChecked
+	albums := make(map[string]*albumState, len(c.albums))
+	for id, st := range c.albums {
+		albums[id] = st
 	}
-	sigs, err := c.client.AlbumSignatures()
+	c.mu.Unlock()
+
+	if assets != nil && time.Since(checked) < albumCheckEvery {
+		return assets, nil
+	}
+	sigs, err := j.client.AlbumSignatures()
 	if err != nil {
-		if errors.Is(err, errUnauthorized) || c.assets == nil {
-			return err
+		if isAuthErr(err) || assets == nil {
+			return nil, err
 		}
 		log.Printf("vérification des albums impossible, liste précédente conservée : %v", err)
-		return nil
+		return assets, nil
 	}
-	changed := c.assets == nil
-	for _, id := range c.cfg.Albums {
+	changed := assets == nil
+	for _, id := range j.cfg.Albums {
 		sig, known := sigs[id]
-		if st := c.albums[id]; st != nil && known && st.sig == sig {
+		if st := albums[id]; st != nil && known && st.sig == sig {
 			continue
 		}
-		name, imgs, err := c.client.AlbumImages(id)
+		name, imgs, err := j.client.AlbumImages(id)
 		if err != nil {
 			if errors.Is(err, errUnauthorized) {
-				return err
+				return nil, err
 			}
-			log.Printf("album %s : %v", id, err)
+			if !known && albums[id] != nil {
+				// Ni listé ni lisible : album supprimé ou partage retiré.
+				log.Printf("album %s inaccessible (%v) : retiré du tirage", id, err)
+				delete(albums, id)
+				changed = true
+			} else {
+				log.Printf("album %s : %v", id, err)
+			}
 			continue
 		}
 		log.Printf("album %q : %d images (rechargé)", name, len(imgs))
-		c.albums[id] = &albumState{sig: sig, name: name, assets: imgs}
+		albums[id] = &albumState{sig: sig, name: name, assets: imgs}
 		changed = true
 	}
-	c.albumsChecked = time.Now()
-	if !changed {
-		return nil
-	}
-	seen := map[string]bool{}
-	var all []Asset
-	for _, id := range c.cfg.Albums {
-		if st := c.albums[id]; st != nil {
-			for _, a := range st.assets {
-				if !seen[a.ID] {
-					seen[a.ID] = true
-					all = append(all, a)
+	all := assets
+	if changed {
+		all = nil
+		seen := map[string]bool{}
+		for _, id := range j.cfg.Albums {
+			if st := albums[id]; st != nil {
+				for _, a := range st.assets {
+					if !seen[a.ID] {
+						seen[a.ID] = true
+						all = append(all, a)
+					}
 				}
 			}
 		}
 	}
-	if len(all) == 0 {
-		return errors.New("aucune image trouvée dans les albums configurés")
+
+	c.mu.Lock()
+	if c.gen == j.gen { // sinon la configuration a changé entre-temps : résultat non mémorisé
+		c.albums, c.albumsChecked, c.assets = albums, time.Now(), all
 	}
-	c.assets = all
-	return nil
+	c.mu.Unlock()
+	if len(all) == 0 {
+		return nil, errors.New("aucune image trouvée dans les albums configurés")
+	}
+	return all, nil
 }
 
 // ---------- choix ----------
 
 // order mélange les assets en repoussant à la fin ceux affichés récemment.
 func (c *Core) order(list []Asset) []Asset {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	recent := map[string]bool{}
 	for _, id := range c.recent {
 		recent[id] = true
@@ -205,73 +266,105 @@ func (c *Core) order(list []Asset) []Asset {
 	return append(fresh, old...)
 }
 
+// remember note une photo affichée (appelé sous c.mu).
 func (c *Core) remember(id string, pool, keepMin int) {
-	max := max(min(pool/2, 100), keepMin)
+	limit := max(min(pool/2, 100), keepMin)
 	c.recent = append(c.recent, id)
-	if len(c.recent) > max {
-		c.recent = c.recent[len(c.recent)-max:]
+	if len(c.recent) > limit {
+		c.recent = c.recent[len(c.recent)-limit:]
 	}
 }
 
-func (c *Core) wantInfo() bool { return c.cfg.ShowPlace || c.cfg.ShowDate }
+func (j *job) wantInfo() bool { return j.cfg.ShowPlace || j.cfg.ShowDate }
 
-// fetchPhotos télécharge n photos distinctes depuis Immich.
-func (c *Core) fetchPhotos(n int) ([]Photo, error) {
-	if err := c.refreshAlbums(); err != nil {
-		return nil, err
+// safeDecode décode une image ; un panic du décodeur (fichier malformé) devient une erreur.
+func safeDecode(decode func() (image.Image, error)) (img image.Image, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			img, err = nil, fmt.Errorf("décodage interrompu : %v", r)
+		}
+	}()
+	return decode()
+}
+
+// online renvoie une source de photos téléchargées depuis Immich, une par appel.
+// Seule la photo demandée est décodée : les portraits écartés (landscape_only) ne sont ni
+// décodés ni mis en cache ; au plus n sont gardés compressés, en secours s'il manque des paysages.
+func (j *job) online(n int, assets []Asset) func() (Photo, error) {
+	type raw struct {
+		asset Asset
+		data  []byte
+		meta  imageMeta
 	}
-	var photos, portraits []Photo
-	tries := 0
+	order := j.c.order(assets)
+	var portraits []raw
 	var lastErr error
-	for _, a := range c.order(c.assets) {
-		if len(photos) >= n || tries >= 15*n {
-			break
-		}
-		tries++
-		data, err := c.client.Download(a.ID, c.cfg.ImageSize)
+	i, tries := 0, 0
+
+	build := func(r raw) (Photo, error) {
+		img, err := safeDecode(func() (image.Image, error) { return r.meta.decode(r.data) })
 		if err != nil {
-			if errors.Is(err, errUnauthorized) {
-				return nil, err
-			}
-			lastErr = err
-			log.Printf("%v", err)
-			continue
+			return Photo{}, err
 		}
-		_, perr := prepareImage(data, c.cfg.LandscapeOnly)
-		if perr != nil && !errors.Is(perr, errNotLandscape) {
-			log.Printf("%s (%s) : %v", a.ID, a.OriginalFileName, perr)
-			continue
-		}
-		img, _, _, err := decodeNormalized(data)
-		if err != nil {
-			log.Printf("%s : %v", a.ID, err)
-			continue
-		}
-		p := Photo{Asset: a, Img: img}
-		if c.wantInfo() {
-			if info, err := c.client.AssetInfo(a.ID); err == nil {
+		p := Photo{Asset: r.asset, Img: img}
+		if j.wantInfo() {
+			if info, err := j.client.AssetInfo(r.asset.ID); err == nil {
 				p.Info = info
 			} else {
-				log.Printf("infos %s : %v", a.ID, err)
+				log.Printf("infos %s : %v", r.asset.ID, err)
 			}
 		}
-		c.saveToCache(p)
-		if errors.Is(perr, errNotLandscape) {
-			portraits = append(portraits, p)
-			continue
+		return p, nil
+	}
+
+	return func() (Photo, error) {
+		for i < len(order) && tries < 15*n {
+			a := order[i]
+			i++
+			tries++
+			data, err := j.client.Download(a.ID, j.cfg.ImageSize)
+			if err != nil {
+				if errors.Is(err, errUnauthorized) {
+					return Photo{}, err
+				}
+				lastErr = err
+				log.Printf("%v", err)
+				continue
+			}
+			meta, err := probeImage(data)
+			if err != nil {
+				log.Printf("%s (%s) : %v", a.ID, a.OriginalFileName, err)
+				continue
+			}
+			r := raw{a, data, meta}
+			if j.cfg.LandscapeOnly && meta.W <= meta.H {
+				if len(portraits) < n {
+					portraits = append(portraits, r)
+				}
+				continue
+			}
+			p, err := build(r)
+			if err != nil {
+				log.Printf("%s : %v", a.ID, err)
+				continue
+			}
+			return p, nil
 		}
-		photos = append(photos, p)
-	}
-	for len(photos) < n && len(portraits) > 0 { // pas assez de paysages : on complète
-		photos, portraits = append(photos, portraits[0]), portraits[1:]
-	}
-	if len(photos) == 0 {
+		for len(portraits) > 0 { // pas assez de paysages : on complète
+			r := portraits[0]
+			portraits = portraits[1:]
+			p, err := build(r)
+			if err != nil {
+				log.Printf("%s : %v", r.asset.ID, err)
+				continue
+			}
+			return p, nil
+		}
 		if lastErr != nil {
-			return nil, lastErr
+			return Photo{}, lastErr
 		}
-		return nil, fmt.Errorf("aucune image utilisable après %d essais (voir le journal)", tries)
+		return Photo{}, fmt.Errorf("aucune image utilisable après %d essais (voir le journal)", tries)
 	}
-	return photos, nil
 }
 
 // ---------- cache hors ligne ----------
@@ -284,29 +377,34 @@ type cacheMeta struct {
 }
 
 // saveToCache garde une copie (redimensionnée à 3840 px max) pour l'affichage hors ligne.
-func (c *Core) saveToCache(p Photo) {
-	if c.cfg.OfflineCache <= 0 {
+func (j *job) saveToCache(p Photo) {
+	if j.cfg.OfflineCache <= 0 || !isUUID(p.Asset.ID) {
 		return
 	}
-	dir := c.cacheDir()
-	os.MkdirAll(dir, 0o755)
-	jpg, err := shrinkJPEG(p.Img)
-	if err != nil {
+	dir := j.c.cacheDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("cache hors ligne : %v", err)
 		return
 	}
 	meta, _ := json.Marshal(cacheMeta{p.Asset, p.Info})
 	base := filepath.Join(dir, p.Asset.ID)
-	if os.WriteFile(base+".jpg", jpg, 0o644) == nil {
-		os.WriteFile(base+".json", meta, 0o644)
+	err := os.WriteFile(base+".jpg", p.jpg, 0o644)
+	if err == nil {
+		err = os.WriteFile(base+".json", meta, 0o644)
 	}
-	c.pruneCache()
+	if err != nil {
+		log.Printf("cache hors ligne : %v", err)
+	}
+	j.pruneCache()
 }
 
 // shrinkJPEG encode l'image en JPEG, redimensionnée à 3840 px max.
 func shrinkJPEG(img image.Image) ([]byte, error) {
-	if b := img.Bounds(); max(b.Dx(), b.Dy()) > 3840 {
-		s := 3840 / float64(max(b.Dx(), b.Dy()))
-		img = compose(img, Screen{W: int(float64(b.Dx()) * s), H: int(float64(b.Dy()) * s)}, "stretch")
+	if b := img.Bounds(); max(b.Dx(), b.Dy()) > keptMaxSide {
+		s := keptMaxSide / float64(max(b.Dx(), b.Dy()))
+		dst := image.NewRGBA(image.Rect(0, 0, max(1, int(float64(b.Dx())*s)), max(1, int(float64(b.Dy())*s))))
+		xdraw.BiLinear.Scale(dst, dst.Bounds(), img, b, draw.Src, nil)
+		img = dst
 	}
 	return encodeJPEG(img)
 }
@@ -333,42 +431,126 @@ func (c *Core) cachedIDs() []string {
 	return ids
 }
 
-func (c *Core) pruneCache() {
-	ids := c.cachedIDs()
-	for _, id := range ids[min(len(ids), c.cfg.OfflineCache):] {
-		os.Remove(filepath.Join(c.cacheDir(), id+".jpg"))
-		os.Remove(filepath.Join(c.cacheDir(), id+".json"))
+func (j *job) pruneCache() {
+	ids := j.c.cachedIDs()
+	for _, id := range ids[min(len(ids), j.cfg.OfflineCache):] {
+		os.Remove(filepath.Join(j.c.cacheDir(), id+".jpg"))
+		os.Remove(filepath.Join(j.c.cacheDir(), id+".json"))
 	}
 }
 
-// cachedPhotos tire n photos du cache local (Immich injoignable).
-func (c *Core) cachedPhotos(n int) ([]Photo, error) {
+// cached renvoie une source de photos tirées du cache local (Immich injoignable).
+// Avec landscape_only, les portraits du cache ne servent qu'en dernier recours.
+func (j *job) cached() func() (Photo, error) {
 	var pool []Asset
-	for _, id := range c.cachedIDs() {
+	for _, id := range j.c.cachedIDs() {
 		pool = append(pool, Asset{ID: id})
 	}
-	var photos []Photo
-	for _, a := range c.order(pool) {
-		if len(photos) >= n {
-			break
-		}
-		base := filepath.Join(c.cacheDir(), a.ID)
+	order := j.c.order(pool)
+	var portraits []string
+	i := 0
+
+	load := func(id string, skipPortrait bool) (Photo, bool) {
+		base := filepath.Join(j.c.cacheDir(), id)
 		var meta cacheMeta
 		mb, err1 := os.ReadFile(base + ".json")
 		jb, err2 := os.ReadFile(base + ".jpg")
 		if err1 != nil || err2 != nil || json.Unmarshal(mb, &meta) != nil {
-			continue
+			return Photo{}, false
+		}
+		if skipPortrait {
+			if ic, err := jpeg.DecodeConfig(bytes.NewReader(jb)); err == nil && ic.Width <= ic.Height {
+				portraits = append(portraits, id)
+				return Photo{}, false
+			}
 		}
 		img, err := jpeg.Decode(bytes.NewReader(jb))
 		if err != nil {
-			continue
+			return Photo{}, false
 		}
-		photos = append(photos, Photo{Asset: meta.Asset, Img: img, Info: meta.Info})
+		return Photo{Asset: meta.Asset, Img: img, Info: meta.Info, jpg: jb}, true
 	}
-	if len(photos) == 0 {
-		return nil, errors.New("cache hors ligne vide")
+
+	return func() (Photo, error) {
+		for i < len(order) {
+			id := order[i].ID
+			i++
+			if p, ok := load(id, j.cfg.LandscapeOnly); ok {
+				return p, nil
+			}
+		}
+		for len(portraits) > 0 {
+			id := portraits[0]
+			portraits = portraits[1:]
+			if p, ok := load(id, false); ok {
+				return p, nil
+			}
+		}
+		return Photo{}, errors.New("cache hors ligne vide")
 	}
-	return photos, nil
+}
+
+// ---------- distribution des photos aux écrans ----------
+
+// feeder fournit les photos une par une au rendu : chaque écran est traité entièrement
+// (téléchargement → décodage → rendu → écriture) avant de passer au suivant, et seules les
+// versions compressées sont conservées entre deux écrans.
+type feeder struct {
+	j        *job
+	src      func() (Photo, error)
+	cache    bool        // photos venant d'Immich : à copier dans le cache hors ligne
+	head     *Photo      // photo déjà obtenue, à servir en premier
+	distinct []keptPhoto // photos différentes obtenues
+	shown    []keptPhoto // photos dans l'ordre d'affichage (répétitions comprises)
+	done     bool
+}
+
+func (f *feeder) next() (Photo, error) {
+	if f.head != nil {
+		p := *f.head
+		f.head = nil
+		f.shown = append(f.shown, keptPhoto{p.Asset, p.Info, p.jpg})
+		return p, nil
+	}
+	if !f.done {
+		p, err := f.fetch()
+		if err == nil {
+			f.shown = append(f.shown, keptPhoto{p.Asset, p.Info, p.jpg})
+			return p, nil
+		}
+		f.done = true
+		if len(f.distinct) == 0 {
+			return Photo{}, err
+		}
+		log.Printf("moins de photos que d'emplacements (%v) : réutilisation", err)
+	}
+	// Moins de photos que d'écrans : on réutilise celles déjà obtenues.
+	k := f.distinct[(len(f.shown)-len(f.distinct))%len(f.distinct)]
+	img, err := jpeg.Decode(bytes.NewReader(k.JPEG))
+	if err != nil {
+		return Photo{}, err
+	}
+	f.shown = append(f.shown, k)
+	return Photo{Asset: k.Asset, Img: img, Info: k.Info, jpg: k.JPEG}, nil
+}
+
+// fetch tire une nouvelle photo de la source et calcule (une seule fois) sa version réduite,
+// partagée entre le cache hors ligne et les photos mémorisées.
+func (f *feeder) fetch() (Photo, error) {
+	p, err := f.src()
+	if err != nil {
+		return Photo{}, err
+	}
+	if p.jpg == nil {
+		if p.jpg, err = shrinkJPEG(p.Img); err != nil {
+			return Photo{}, err
+		}
+		if f.cache {
+			f.j.saveToCache(p)
+		}
+	}
+	f.distinct = append(f.distinct, keptPhoto{p.Asset, p.Info, p.jpg})
+	return p, nil
 }
 
 // ---------- application ----------
@@ -382,133 +564,174 @@ type Result struct {
 
 // targets détermine les écrans à couvrir et le nombre de photos nécessaires
 // (une par écran, deux pour un écran très large découpé en deux panneaux).
-func (c *Core) targets() (mons []Monitor, single Screen, n int) {
-	if c.cfg.MultiMonitor == "different" && c.monitors != nil && c.setMonitorWallpapers != nil {
+func (j *job) targets() (mons []Monitor, single Screen, n int) {
+	c := j.c
+	if j.cfg.MultiMonitor == "different" && c.monitors != nil && c.setMonitorWallpapers != nil {
 		if m := c.monitors(); len(m) > 1 {
 			mons = m
 		}
 	}
 	if mons == nil {
 		if c.screen != nil {
-			single = c.screen(c.cfg.Style)
+			single = c.screen(j.cfg.Style)
 		}
-		return nil, single, c.panels(single)
+		return nil, single, j.panels(single)
 	}
 	for _, m := range mons {
-		n += c.panels(m.Screen)
+		n += j.panels(m.Screen)
 	}
 	return mons, single, n
 }
 
-func (c *Core) applyTo(photos []Photo, mons []Monitor, single Screen) (string, error) {
+func (j *job) applyTo(next func() (Photo, error), mons []Monitor, single Screen) (string, error) {
 	if mons == nil {
-		return c.applySingle(photos, single)
+		return j.applySingle(next, single)
 	}
-	return c.applyMulti(photos, mons)
+	return j.applyMulti(next, mons)
+}
+
+func take(next func() (Photo, error), n int) ([]Photo, error) {
+	photos := make([]Photo, 0, n)
+	for len(photos) < n {
+		p, err := next()
+		if err != nil {
+			return nil, err
+		}
+		photos = append(photos, p)
+	}
+	return photos, nil
+}
+
+// guard transforme un panic (décodeur, rendu) en erreur journalisée : l'appli est un binaire
+// sans console, un panic non récupéré la ferait disparaître sans message.
+func guard(what string, err *error) {
+	if r := recover(); r != nil {
+		log.Printf("panic pendant %s : %v\n%s", what, r, debug.Stack())
+		*err = fmt.Errorf("erreur interne pendant %s : %v (voir le journal)", what, r)
+	}
 }
 
 // Reapply recalcule le fond d'écran avec les photos actuelles pour la configuration d'écrans
-// courante (branchement, résolution…). S'il faut plus de photos qu'avant, on en tire de nouvelles.
-func (c *Core) Reapply() (Result, error) {
-	c.mu.Lock()
-	if c.cfg == nil {
-		c.mu.Unlock()
-		return Result{}, errors.New("configuration incomplète")
-	}
-	mons, single, n := c.targets()
-	if len(c.lastPhotos) < n {
-		c.mu.Unlock()
-		log.Printf("écrans modifiés : %d photo(s) nécessaire(s), nouveau tirage", n)
-		return c.Next()
-	}
-	defer c.mu.Unlock()
+// courante (branchement, résolution…). S'il faut plus de photos qu'avant, renvoie errNeedDraw :
+// c'est à l'appelant de décider d'un nouveau tirage (pause, planification).
+func (c *Core) Reapply() (res Result, err error) {
+	c.run.Lock()
+	defer c.run.Unlock()
 	defer debug.FreeOSMemory()
-	photos := make([]Photo, 0, n)
-	for _, k := range c.lastPhotos[:n] {
+	defer guard("le recalcul", &err)
+	j, err := c.begin()
+	if err != nil {
+		return Result{}, err
+	}
+	mons, single, n := j.targets()
+	c.mu.Lock()
+	last := c.lastPhotos
+	c.mu.Unlock()
+	if len(last) < n {
+		return Result{}, errNeedDraw
+	}
+	i := 0
+	next := func() (Photo, error) {
+		k := last[i]
+		i++
 		img, err := jpeg.Decode(bytes.NewReader(k.JPEG))
 		if err != nil {
-			return Result{}, err
+			return Photo{}, err
 		}
-		photos = append(photos, Photo{Asset: k.Asset, Img: img, Info: k.Info})
+		return Photo{Asset: k.Asset, Img: img, Info: k.Info, jpg: k.JPEG}, nil
 	}
-	path, err := c.applyTo(photos, mons, single)
+	path, err := j.applyTo(next, mons, single)
 	if err != nil {
 		return Result{}, err
 	}
 	log.Printf("écrans modifiés : fond d'écran recalculé (%d photo(s))", n)
-	if c.cfg.LockScreen && c.setLockScreen != nil {
-		c.setLockScreen(path)
-	}
-	return Result{Asset: c.lastPhotos[0].Asset}, nil
+	j.lockScreen(path)
+	return Result{Asset: last[0].Asset}, nil
 }
 
 // Next choisit et applique de nouvelles images (une par écran si demandé).
-func (c *Core) Next() (Result, error) {
-	res, err := c.next()
-	debug.FreeOSMemory() // rend la RAM à Windows après le pic de décodage
-	return res, err
+func (c *Core) Next() (res Result, err error) {
+	c.run.Lock()
+	defer c.run.Unlock()
+	defer debug.FreeOSMemory() // rend la RAM à Windows après le pic de décodage
+	defer guard("le changement d'image", &err)
+	j, err := c.begin()
+	if err != nil {
+		return Result{}, err
+	}
+	return j.next()
 }
 
-func (c *Core) next() (Result, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cfg == nil {
-		return Result{}, errors.New("configuration incomplète : ouvre les paramètres")
-	}
-
-	mons, single, n := c.targets()
+func (j *job) next() (Result, error) {
+	c := j.c
+	mons, single, n := j.targets()
 
 	res := Result{}
-	photos, err := c.fetchPhotos(n)
+	f := &feeder{j: j, cache: true}
+	assets, err := j.refreshAlbums()
+	if err == nil {
+		f.src = j.online(n, assets)
+		var p Photo
+		if p, err = f.fetch(); err == nil {
+			f.head = &p
+		}
+	}
 	if err != nil {
-		cached, cerr := c.cachedPhotos(n)
+		off := &feeder{j: j, src: j.cached()}
+		p, cerr := off.fetch()
 		if cerr != nil {
 			return Result{}, err
 		}
 		log.Printf("Immich injoignable (%v) : photo du cache hors ligne", err)
-		photos, res.Offline, res.Cause = cached, true, err
-	}
-	for i, orig := 0, len(photos); len(photos) < n; i++ { // moins de photos que d'écrans : on réutilise
-		photos = append(photos, photos[i%orig])
+		off.head = &p
+		f, res.Offline, res.Cause = off, true, err
 	}
 
-	primaryPath, err := c.applyTo(photos, mons, single)
+	primaryPath, err := j.applyTo(f.next, mons, single)
 	if err != nil {
 		return Result{}, err
 	}
-	c.lastPhotos = nil
-	for _, p := range photos {
-		jpg, err := shrinkJPEG(p.Img)
-		if err != nil {
-			c.lastPhotos = nil
-			break
-		}
-		c.lastPhotos = append(c.lastPhotos, keptPhoto{p.Asset, p.Info, jpg})
-	}
+	first := f.shown[0].Asset
 
-	pool := len(c.assets)
+	pool := len(assets)
 	if res.Offline {
 		pool = len(c.cachedIDs())
 	}
-	for _, p := range photos {
-		c.remember(p.Asset.ID, pool, n)
-		log.Printf("fond d'écran : %s (%s)", p.Asset.OriginalFileName, p.Asset.ID)
+	c.mu.Lock()
+	c.lastPhotos = f.shown
+	for _, k := range f.distinct {
+		c.remember(k.Asset.ID, pool, n)
+		log.Printf("fond d'écran : %s (%s)", k.Asset.OriginalFileName, k.Asset.ID)
 	}
-	c.last, c.lastOK = photos[0].Asset, true
+	c.last, c.lastOK = first, true
+	recent, _ := json.Marshal(c.recent)
+	c.mu.Unlock()
+	if err := os.WriteFile(c.recentPath(), recent, 0o644); err != nil {
+		log.Printf("historique des photos : %v", err)
+	}
+
 	if c.afterApply != nil {
-		c.afterApply(c.cfg, photos[0].Asset, c.client.WebURL(photos[0].Asset.ID))
+		c.afterApply(j.cfg, first, j.client.WebURL(first.ID))
 	}
-	if c.cfg.LockScreen && c.setLockScreen != nil {
-		// Écran de verrouillage : photo de l'écran principal ; erreur journalisée mais non bloquante.
-		if err := c.setLockScreen(primaryPath); err != nil {
-			log.Printf("écran de verrouillage : %v", err)
-			c.lockErr = err
-		} else {
-			c.lockErr = nil
-		}
-	}
-	res.Asset = photos[0].Asset
+	j.lockScreen(primaryPath)
+	res.Asset = first
 	return res, nil
+}
+
+// lockScreen applique la photo de l'écran principal à l'écran de verrouillage ;
+// l'erreur est journalisée et mémorisée, mais non bloquante.
+func (j *job) lockScreen(path string) {
+	c := j.c
+	if !j.cfg.LockScreen || c.setLockScreen == nil {
+		return
+	}
+	err := c.setLockScreen(path)
+	if err != nil {
+		log.Printf("écran de verrouillage : %v", err)
+	}
+	c.mu.Lock()
+	c.lockErr = err
+	c.mu.Unlock()
 }
 
 func (c *Core) nextName(prefix string) string {
@@ -524,22 +747,32 @@ func (c *Core) nextName(prefix string) string {
 const splitRatio = 2.8
 
 // panels : nombre de photos à afficher sur cet écran (2 si très large et option active).
-func (c *Core) panels(sc Screen) int {
-	if c.cfg.SplitWide && sc.H > 0 && float64(sc.W)/float64(sc.H) >= splitRatio {
+func (j *job) panels(sc Screen) int {
+	if j.cfg.SplitWide && sc.H > 0 && float64(sc.W)/float64(sc.H) >= splitRatio {
 		return 2
 	}
 	return 1
 }
 
-func (c *Core) applySingle(photos []Photo, sc Screen) (string, error) {
-	style := c.cfg.Style
+func (j *job) applySingle(next func() (Photo, error), sc Screen) (string, error) {
+	c := j.c
+	photos, err := take(next, j.panels(sc))
+	if err != nil {
+		return "", err
+	}
+	style := j.cfg.Style
 	var jpg []byte
-	var err error
-	if (c.wantInfo() || len(photos) > 1) && sc.W > 0 {
-		jpg, err = c.render(photos, sc)
-		style = "fill" // l'image fait déjà la taille de l'écran
+	if (j.wantInfo() || len(photos) > 1) && sc.W > 0 {
+		jpg, err = j.render(photos, sc)
+		// L'image fait déjà la taille de l'écran. En « Étendre », elle fait celle du bureau
+		// virtuel : il faut garder ce style pour qu'elle s'étale sur tous les écrans.
+		if style != "span" {
+			style = "fill"
+		}
+	} else if p := photos[0]; p.jpg != nil && max(p.Img.Bounds().Dx(), p.Img.Bounds().Dy()) <= keptMaxSide {
+		jpg = p.jpg // pas de réduction : la version gardée est déjà l'image complète
 	} else {
-		jpg, err = encodeJPEG(photos[0].Img)
+		jpg, err = encodeJPEG(p.Img)
 	}
 	if err != nil {
 		return "", err
@@ -553,14 +786,17 @@ func (c *Core) applySingle(photos []Photo, sc Screen) (string, error) {
 }
 
 // applyMulti rend les photos de chaque écran à sa taille exacte puis les applique.
-func (c *Core) applyMulti(photos []Photo, mons []Monitor) (string, error) {
+// Les photos d'un écran sont libérées avant de traiter l'écran suivant.
+func (j *job) applyMulti(next func() (Photo, error), mons []Monitor) (string, error) {
+	c := j.c
 	paths := map[string]string{}
 	var primary string
-	k := 0
 	for i, m := range mons {
-		np := c.panels(m.Screen)
-		jpg, err := c.render(photos[k:k+np], m.Screen)
-		k += np
+		photos, err := take(next, j.panels(m.Screen))
+		if err != nil {
+			return "", err
+		}
+		jpg, err := j.render(photos, m.Screen)
 		if err != nil {
 			return "", err
 		}
@@ -579,12 +815,12 @@ func (c *Core) applyMulti(photos []Photo, mons []Monitor) (string, error) {
 
 // render produit l'image d'un écran : une photo, ou deux côte à côte (écran très large),
 // séparées par une fine bande sombre, chacune avec sa légende vers le bord extérieur.
-func (c *Core) render(photos []Photo, sc Screen) ([]byte, error) {
+func (j *job) render(photos []Photo, sc Screen) ([]byte, error) {
 	if sc.W < 320 || sc.H < 240 {
 		return nil, fmt.Errorf("taille d'écran inattendue %dx%d", sc.W, sc.H)
 	}
 	if len(photos) == 1 {
-		return encodeJPEG(c.renderPanel(photos[0], sc, c.cfg.CaptionPosition))
+		return encodeJPEG(j.renderPanel(photos[0], sc, j.cfg.CaptionPosition))
 	}
 	dst := image.NewRGBA(image.Rect(0, 0, sc.W, sc.H))
 	gap := max(2, sc.H/270) // ≈ 4 px en 1080p, 5 px en 1440p
@@ -595,43 +831,29 @@ func (c *Core) render(photos []Photo, sc Screen) ([]byte, error) {
 		if i == len(photos)-1 {
 			w = sc.W - x
 		}
-		pos := c.cfg.CaptionPosition
+		pos := j.cfg.CaptionPosition
 		if i == 0 && len(photos) == 2 { // panneau gauche : légende côté gauche (bord extérieur)
 			pos = strings.Replace(pos, "right", "left", 1)
 		} else if i == len(photos)-1 {
 			pos = strings.Replace(pos, "left", "right", 1)
 		}
-		panel := c.renderPanel(p, Screen{W: w, H: sc.H, BottomInset: sc.BottomInset}, pos)
+		panel := j.renderPanel(p, Screen{W: w, H: sc.H, BottomInset: sc.BottomInset}, pos)
 		draw.Draw(dst, image.Rect(x, 0, x+w, sc.H), panel, image.Point{}, draw.Src)
 		x += w + gap
 	}
 	return encodeJPEG(dst)
 }
 
-func (c *Core) renderPanel(p Photo, sc Screen, pos string) *image.RGBA {
-	dst := compose(p.Img, sc, c.cfg.Style)
-	if c.wantInfo() {
-		place, date := captionParts(p.Info, c.cfg.ShowPlace, c.cfg.ShowDate)
-		if c.fonts == nil {
-			c.fonts = loadFonts()
+func (j *job) renderPanel(p Photo, sc Screen, pos string) *image.RGBA {
+	dst := compose(p.Img, sc, j.cfg.Style)
+	if j.wantInfo() {
+		place, date := captionParts(p.Info, j.cfg.ShowPlace, j.cfg.ShowDate)
+		if j.c.fonts == nil {
+			j.c.fonts = loadFonts()
 		}
-		drawCaption(dst, c.fonts, place, date, pos, sc.BottomInset)
+		drawCaption(dst, j.c.fonts, place, date, pos, sc.BottomInset)
 	}
 	return dst
-}
-
-// prepareImage vérifie que l'image est lisible et son orientation (EXIF compris).
-// En cas de portrait, renvoie quand même les données (utilisables en secours) avec errNotLandscape.
-func prepareImage(data []byte, landscapeOnly bool) ([]byte, error) {
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("format non pris en charge (HEIC/RAW ? utilise image_size=fullsize) : %w", err)
-	}
-	w, h := orientedSize(data, cfg.Width, cfg.Height)
-	if landscapeOnly && w <= h {
-		return data, errNotLandscape
-	}
-	return data, nil
 }
 
 func encodeJPEG(img image.Image) ([]byte, error) {
