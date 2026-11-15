@@ -87,9 +87,17 @@ pub fn compose(src: &RgbImage, sc: Screen, style: &str) -> RgbImage {
         }
         // fill ; span : même recadrage, l'écran passé est alors le bureau virtuel.
         _ => {
+            // Zone recadrée alignée sur des pixels entiers et strictement dans l'image.
             let s = (w / sw).max(h / sh);
-            let (cw, ch) = ((w / s).min(sw), (h / s).min(sh));
-            resize(src, Some(((sw - cw) / 2.0, (sh - ch) / 2.0, cw, ch)), dw, dh, filter)
+            let cw = (w / s).round().clamp(1.0, sw);
+            let ch = (h / s).round().clamp(1.0, sh);
+            resize(
+                src,
+                Some((((sw - cw) / 2.0).floor(), ((sh - ch) / 2.0).floor(), cw, ch)),
+                dw,
+                dh,
+                filter,
+            )
         }
     }
 }
@@ -167,6 +175,56 @@ mod tests {
         // Centrer une image plus grande que l'écran : rognée, sans débordement.
         let big = RgbImage::from_pixel(900, 700, WHITE);
         assert_eq!(*compose(&big, sc, "center").get_pixel(0, 0), WHITE);
+    }
+
+    /// Balayage de tailles d'image et d'écran : les builds de test vérifient les accès mémoire
+    /// de la bibliothèque de redimensionnement (un recadrage non entier la faisait lire hors
+    /// limites sur x64).
+    #[test]
+    fn resize_stays_in_bounds() {
+        let mut seed = 7u32;
+        let mut rnd = move |max: u32| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            1 + (seed >> 8) % max
+        };
+        for i in 0..400 {
+            let src = RgbImage::from_pixel(rnd(300), rnd(300), WHITE);
+            let sc = Screen {
+                w: 320 + rnd(700) as i32,
+                h: 240 + rnd(500) as i32,
+                bottom_inset: 0,
+            };
+            let style = ["fill", "fit", "stretch", "span", "center", "tile"][i % 6];
+            let dst = compose(&src, sc, style);
+            assert_eq!((dst.width() as i32, dst.height() as i32), (sc.w, sc.h));
+            if matches!(style, "fill" | "stretch" | "span") {
+                assert_eq!(
+                    *dst.get_pixel(dst.width() - 1, dst.height() - 1),
+                    WHITE,
+                    "{style} {}x{} → {sc:?}",
+                    src.width(),
+                    src.height()
+                );
+            }
+        }
+        // Réduction de grandes images et recadrages partiels (fond flouté de la légende).
+        for (w, h) in [(3841, 2161), (4000, 37), (53, 4500), (3840, 3840)] {
+            let jpg = shrink_jpeg(&RgbImage::new(w, h)).unwrap();
+            let (jw, jh) = jpeg_dims(&jpg).unwrap();
+            assert!(jw.max(jh) <= KEPT_MAX_SIDE && jw >= 1 && jh >= 1);
+        }
+        let big = RgbImage::from_pixel(641, 479, WHITE);
+        for (x, y, w, h) in [
+            (0.0, 0.0, 641.0, 479.0),
+            (600.0, 400.0, 41.0, 79.0),
+            (13.0, 7.0, 1.0, 1.0),
+            (0.0, 478.0, 641.0, 1.0),
+        ] {
+            for (dw, dh) in [(1, 1), (7, 5), (300, 200), (1000, 3)] {
+                let out = resize(&big, Some((x, y, w, h)), dw, dh, fr::FilterType::Bilinear);
+                assert_eq!(*out.get_pixel(dw - 1, dh - 1), WHITE);
+            }
+        }
     }
 
     #[test]
