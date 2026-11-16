@@ -1,14 +1,18 @@
 //! Tests du cœur, face à un faux serveur Immich (portés de la version Go).
 
-use crate::config::{AlbumRule, Config};
+use crate::config::{read_config, write_default_config, AlbumRule, Config};
 use crate::core::{Core, Hooks, Monitor, HISTORY_DEPTH};
 use crate::immich::Client;
 use crate::render::{jpeg_dims, Screen};
+use crate::settings::{SettingsHooks, SettingsServer};
 use crate::testutil::*;
+use crate::update::{asset_name, update_asset_name, update_plan, UpdatePlan};
 use crate::util::{Error, Local};
+use crate::{has_portable_marker, portable_by_marker, PORTABLE_MARKER};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Ce que la « plateforme » de test a reçu, et ce qu'elle répond.
 #[derive(Default)]
@@ -583,4 +587,164 @@ fn auth_errors() {
     let e = c.download(L1, "preview").unwrap_err();
     assert!(!e.is_auth() && fake.total() == before, "requête après close : {e}");
     assert_eq!(c.fingerprint(), "", "aucun certificat épinglé sans l'option");
+}
+
+// ---------- version portable et page de réglages à la demande (v1.10 de la version Go) ----------
+
+/// Fichier témoin portable.txt à côté de l'exe (zip portable, à la manière d'omnictl).
+#[test]
+fn portable_marker() {
+    let dir = temp_dir("marker");
+    assert!(!has_portable_marker(&dir), "dossier vide vu comme portable");
+    std::fs::create_dir(dir.join(PORTABLE_MARKER)).unwrap();
+    assert!(
+        !has_portable_marker(&dir),
+        "un dossier portant le nom du témoin ne doit pas compter"
+    );
+    let other = temp_dir("marker");
+    std::fs::write(other.join(PORTABLE_MARKER), "x").unwrap();
+    assert!(has_portable_marker(&other), "témoin non détecté");
+    // L'exe de test n'a pas de témoin à côté de lui : les autres tests voient la version classique.
+    assert!(!portable_by_marker(), "témoin inattendu à côté de l'exe de test");
+}
+
+/// Version portable : rien n'est déposé hors de son dossier par défaut (icône du bureau), et
+/// le zip (exe classique + témoin) se met à jour avec l'exe classique.
+#[test]
+fn portable_defaults() {
+    assert!(
+        Config::default().desktop_link,
+        "version classique : icône du bureau attendue par défaut"
+    );
+    let classic_asset = update_asset_name();
+    let _portable = crate::simulate_portable(true);
+    assert!(crate::is_portable());
+    assert!(
+        !Config::default().desktop_link,
+        "version portable : pas d'icône sur le bureau par défaut"
+    );
+    let cfg_path = temp_dir("portable").join("config.json");
+    write_default_config(&cfg_path).unwrap();
+    assert!(!read_config(&cfg_path).unwrap().desktop_link, "configuration portable par défaut");
+    // Réglage absent du fichier : valeur par défaut de la version portable ; choix explicite gardé.
+    std::fs::write(&cfg_path, r#"{"server_url": "https://immich.exemple.fr"}"#).unwrap();
+    assert!(!read_config(&cfg_path).unwrap().desktop_link);
+    std::fs::write(&cfg_path, r#"{"desktop_link": true}"#).unwrap();
+    assert!(read_config(&cfg_path).unwrap().desktop_link);
+    // Portable par le seul témoin : l'exe se met à jour selon sa variante (l'exe classique pour
+    // le zip portable), le témoin reste à côté.
+    assert_eq!(update_asset_name(), classic_asset);
+    assert_eq!(update_asset_name(), asset_name(std::env::consts::ARCH, crate::FLAVOR));
+}
+
+/// Version portable : la vérification quotidienne ne télécharge rien, elle annonce seulement la
+/// nouvelle version dans le menu ; un clic demande confirmation puis installe.
+#[test]
+fn portable_updates_on_click() {
+    use UpdatePlan::*;
+    for (manual, portable, skipped, want) in [
+        (false, false, false, Install),
+        (false, false, true, Skip),
+        (false, true, false, Offer),
+        (false, true, true, Skip),
+        (true, false, false, Confirm),
+        (true, true, false, Confirm),
+    ] {
+        assert_eq!(
+            update_plan(manual, portable, skipped),
+            want,
+            "manuel={manual} portable={portable} ignorée={skipped}"
+        );
+    }
+}
+
+/// « Image suivante » qui dure : la page ne répond qu'à la fin du téléchargement.
+struct SlowNext;
+
+impl SettingsHooks for SlowNext {
+    fn saved(&self, _cfg: Config) {}
+    fn next(&self) -> Result<String, String> {
+        std::thread::sleep(Duration::from_millis(2000));
+        Ok("ok".into())
+    }
+    fn status(&self) -> String {
+        "prêt".into()
+    }
+    fn excluded(&self) -> usize {
+        0
+    }
+    fn clear_excluded(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn get_json(url: &str) -> serde_json::Value {
+    let text = ureq::get(url)
+        .timeout(Duration::from_secs(5))
+        .call()
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.into_string().map_err(|e| e.to_string()))
+        .unwrap_or_else(|e| panic!("{url} : {e}"));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{url} : {e} : {text}"))
+}
+
+fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !cond() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// La page de réglages n'ouvre son port qu'à la demande et le referme après inactivité, jamais
+/// pendant une requête en cours.
+#[test]
+fn settings_server_on_demand() {
+    let cfg_path = temp_dir("settings_idle").join("config.json");
+    write_default_config(&cfg_path).unwrap();
+    let s = SettingsServer::with_idle(&cfg_path, Duration::from_millis(500)).unwrap();
+    s.set_hooks(Arc::new(SlowNext));
+    assert_eq!(s.url(), "", "port ouvert avant la première ouverture");
+    let u = s.open().unwrap();
+    assert!(!u.is_empty() && u == s.url(), "{u}");
+    assert_eq!(s.open().unwrap(), u, "une seconde ouverture doit réutiliser le port ouvert");
+    assert_eq!(get_json(&format!("{u}api/status"))["status"], "prêt");
+    // La page sait qu'elle sert la version classique (libellé des mises à jour).
+    assert_eq!(get_json(&format!("{u}api/config"))["portable"], false);
+    let page = ureq::get(&u).call().unwrap().into_string().unwrap();
+    assert!(page.contains("visibilitychange") && page.contains("Page fermée après inactivité"));
+
+    // Requête plus longue que le délai d'inactivité : le port reste ouvert jusqu'à sa fin.
+    let next_url = format!("{u}api/next");
+    let slow = std::thread::spawn(move || {
+        ureq::post(&next_url)
+            .set("Content-Type", "application/json")
+            .send_string("{}")
+            .map(|r| r.status())
+            .map_err(|e| e.to_string())
+    });
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(s.url(), u, "port refermé pendant une requête en cours");
+    assert_eq!(slow.join().unwrap(), Ok(200));
+
+    // Plus aucune requête : le port se referme, et il est vraiment libéré.
+    wait_until("port toujours ouvert après inactivité", || s.url().is_empty());
+    let addr: std::net::SocketAddr = u["http://".len()..].split('/').next().unwrap().parse().unwrap();
+    wait_until("la page écoute encore après fermeture", || {
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_err()
+    });
+
+    // Rouverte depuis l'icône : nouveau port, même page.
+    let u2 = s.open().unwrap();
+    assert!(!u2.is_empty());
+    assert_eq!(get_json(&format!("{u2}api/status"))["status"], "prêt", "page non rouverte");
+    s.close();
+    assert_eq!(s.url(), "", "close n'a pas fermé le port");
+
+    // Version portable : la page adapte le libellé de la case « mises à jour ».
+    let _portable = crate::simulate_portable(true);
+    let p = SettingsServer::new(&cfg_path).unwrap();
+    let pu = p.open().unwrap();
+    assert_eq!(get_json(&format!("{pu}api/config"))["portable"], true);
+    p.close();
 }

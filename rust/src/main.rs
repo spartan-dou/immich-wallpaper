@@ -37,9 +37,53 @@ pub const FLAVOR: &str = match option_env!("IW_FLAVOR") {
     None => "",
 };
 
+/// Fichier qui, posé à côté de l'exe, le rend portable, quelle que soit sa variante (c'est ce
+/// que contient le zip portable : l'exe classique et ce fichier). Le supprimer rend l'appli
+/// « normale ».
+pub const PORTABLE_MARKER: &str = "portable.txt";
+
+/// Indique si le dossier contient le fichier témoin de la version portable.
+pub fn has_portable_marker(dir: &std::path::Path) -> bool {
+    std::fs::metadata(dir.join(PORTABLE_MARKER)).map(|m| m.is_file()).unwrap_or(false)
+}
+
+/// Témoin à côté de l'exe : évalué une fois, l'exe ne change pas de dossier en cours de route.
+pub fn portable_by_marker() -> bool {
+    static MARKER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MARKER.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(has_portable_marker))
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests : variante portable simulée pour le thread courant (None : celle de l'exe de test).
+    static TEST_PORTABLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests : simule (ou non) la version portable sur le thread courant, jusqu'à la fin de la portée.
+#[cfg(test)]
+pub fn simulate_portable(on: bool) -> impl Drop {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_PORTABLE.with(|c| c.set(self.0));
+        }
+    }
+    Reset(TEST_PORTABLE.with(|c| c.replace(Some(on))))
+}
+
+/// Version portable : variante `IW_FLAVOR=portable`, ou fichier témoin à côté de l'exe.
 #[allow(dead_code)]
 pub fn is_portable() -> bool {
-    FLAVOR == "portable"
+    #[cfg(test)]
+    if let Some(on) = TEST_PORTABLE.with(|c| c.get()) {
+        return on;
+    }
+    FLAVOR == "portable" || portable_by_marker()
 }
 
 #[allow(dead_code)]

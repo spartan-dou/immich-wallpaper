@@ -1,4 +1,5 @@
-//! Page de réglages servie sur 127.0.0.1, protégée par un jeton aléatoire dans l'URL.
+//! Page de réglages servie sur 127.0.0.1, protégée par un jeton aléatoire dans l'URL. Le port
+//! n'est ouvert qu'à la demande (`open`) et se referme après inactivité.
 
 use crate::config::{normalize_fingerprint, read_config_or_default, same_server, save_config, Config};
 use crate::immich::Client;
@@ -7,12 +8,18 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response};
 
 const SETTINGS_HTML: &[u8] = include_bytes!("../../settings.html");
 
 /// Taille maximale du corps d'une requête de la page (la configuration fait quelques Ko).
 const MAX_BODY: u64 = 1 << 20;
+
+/// La page de réglages s'arrête après ce délai sans requête. Ouverte, elle interroge l'état
+/// toutes les 5 s (seulement quand l'onglet est visible) : le port ne reste donc ouvert que
+/// pendant que la page sert, pas en permanence.
+pub const SETTINGS_IDLE: Duration = Duration::from_secs(10 * 60);
 
 /// Ce que la page peut demander à l'appli.
 pub trait SettingsHooks: Send + Sync {
@@ -25,10 +32,26 @@ pub trait SettingsHooks: Send + Sync {
     fn clear_excluded(&self) -> Result<(), String>;
 }
 
+/// État de l'écoute.
+struct Listen {
+    server: Option<Arc<tiny_http::Server>>,
+    /// "" : fermée.
+    addr: String,
+    /// Numéro de l'ouverture en cours (la surveillance d'une ouverture précédente s'arrête).
+    generation: u64,
+    /// Dernière requête valide.
+    last: Instant,
+    /// Requêtes en cours (« Image suivante » peut durer).
+    active: usize,
+}
+
 pub struct SettingsServer {
     cfg_path: PathBuf,
     token: String,
-    addr: String,
+    idle: Duration,
+    /// La page adapte ses libellés (mises à jour sur clic).
+    portable: bool,
+    listen: Mutex<Listen>,
     /// Protège les lectures/écritures du fichier de configuration.
     file: Mutex<()>,
     /// Empreinte du certificat vu lors du dernier test réussi, par URL de serveur (option
@@ -56,42 +79,135 @@ fn header(req: &Request, name: &'static str) -> Option<String> {
         .map(|h| h.value.as_str().to_string())
 }
 
+/// Requête de la page en cours : le port reste ouvert jusqu'à sa fin.
+struct Activity<'a>(&'a SettingsServer);
+
+impl Drop for Activity<'_> {
+    fn drop(&mut self) {
+        let mut l = lock(&self.0.listen);
+        l.active -= 1;
+        l.last = Instant::now();
+    }
+}
+
 impl SettingsServer {
-    pub fn start(cfg_path: &Path) -> Res<Arc<SettingsServer>> {
+    /// Prépare la page de réglages sans ouvrir de port.
+    pub fn new(cfg_path: &Path) -> Res<Arc<SettingsServer>> {
+        Self::with_idle(cfg_path, SETTINGS_IDLE)
+    }
+
+    /// idle : délai sans requête au bout duquel le port se referme (zéro : jamais).
+    pub fn with_idle(cfg_path: &Path, idle: Duration) -> Res<Arc<SettingsServer>> {
         let mut b = [0u8; 16];
         getrandom::fill(&mut b).map_err(|e| Error::Msg(format!("générateur aléatoire indisponible : {e}")))?;
-        let server = tiny_http::Server::http("127.0.0.1:0").map_err(|e| Error::Msg(e.to_string()))?;
-        let s = Arc::new(SettingsServer {
+        Ok(Arc::new(SettingsServer {
             cfg_path: cfg_path.to_path_buf(),
             token: crate::util::hex(&b),
-            addr: server.server_addr().to_string(),
+            idle,
+            portable: crate::is_portable(),
+            listen: Mutex::new(Listen {
+                server: None,
+                addr: String::new(),
+                generation: 0,
+                last: Instant::now(),
+                active: 0,
+            }),
             file: Mutex::new(()),
             seen_pins: Mutex::new(HashMap::new()),
             hooks: OnceLock::new(),
-        });
-        let srv = s.clone();
-        std::thread::spawn(move || {
-            for req in server.incoming_requests() {
-                // Un thread par requête : « Image suivante » ne répond qu'à la fin du téléchargement.
-                let srv = srv.clone();
-                std::thread::spawn(move || srv.serve(req));
-            }
-            crate::logf!("page de réglages arrêtée");
-        });
-        Ok(s)
+        }))
     }
 
     pub fn set_hooks(&self, h: Arc<dyn SettingsHooks>) {
         let _ = self.hooks.set(h);
     }
 
+    /// Ouvre le port de la page s'il est fermé et renvoie l'adresse à ouvrir dans le navigateur.
+    pub fn open(self: &Arc<Self>) -> Res<String> {
+        let mut l = lock(&self.listen);
+        l.last = Instant::now();
+        if l.server.is_none() {
+            let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").map_err(|e| Error::Msg(e.to_string()))?);
+            l.generation += 1;
+            l.addr = server.server_addr().to_string();
+            l.server = Some(server.clone());
+            let (srv, generation) = (self.clone(), l.generation);
+            std::thread::spawn(move || {
+                for req in server.incoming_requests() {
+                    // Un thread par requête : « Image suivante » ne répond qu'à la fin du téléchargement.
+                    let srv = srv.clone();
+                    std::thread::spawn(move || srv.serve(req));
+                }
+                // Fin de l'écoute sans fermeture demandée (erreur d'acceptation) : la prochaine
+                // ouverture rouvre un port.
+                let mut l = lock(&srv.listen);
+                if l.generation == generation && l.server.take().is_some() {
+                    l.addr.clear();
+                    crate::logf!("page de réglages arrêtée");
+                }
+            });
+            if !self.idle.is_zero() {
+                let srv = self.clone();
+                std::thread::spawn(move || srv.close_when_idle(generation));
+            }
+        }
+        Ok(self.url_for(&l.addr))
+    }
+
+    /// Referme le port quand la page ne sert plus (onglet fermé ou caché).
+    fn close_when_idle(&self, generation: u64) {
+        let tick = (self.idle / 4).clamp(Duration::from_millis(10), Duration::from_secs(60));
+        loop {
+            std::thread::sleep(tick);
+            // Vérification et fermeture sous le même verrou : une requête qui arrive entre-temps
+            // est soit comptée (et le port reste ouvert), soit refusée.
+            let server = {
+                let mut l = lock(&self.listen);
+                if l.generation != generation || l.server.is_none() {
+                    return; // déjà refermée (et peut-être rouverte depuis)
+                }
+                if l.active > 0 || l.last.elapsed() < self.idle {
+                    continue;
+                }
+                l.addr.clear();
+                l.server.take()
+            };
+            if let Some(s) = server {
+                s.unblock();
+                crate::logf!("page de réglages fermée après inactivité (plus aucun port ouvert)");
+            }
+            return;
+        }
+    }
+
+    /// Referme le port de la page. Le serveur libère son port dès que son fil d'écoute,
+    /// débloqué ici, s'arrête.
+    pub fn close(&self) {
+        let server = {
+            let mut l = lock(&self.listen);
+            l.addr.clear();
+            l.server.take()
+        };
+        if let Some(s) = server {
+            s.unblock();
+        }
+    }
+
+    /// Adresse de la page ("" si son port est fermé).
     pub fn url(&self) -> String {
-        format!("http://{}/{}/", self.addr, self.token)
+        self.url_for(&lock(&self.listen).addr)
+    }
+
+    fn url_for(&self, addr: &str) -> String {
+        if addr.is_empty() {
+            return String::new();
+        }
+        format!("http://{addr}/{}/", self.token)
     }
 
     #[cfg(test)]
-    pub fn addr(&self) -> &str {
-        &self.addr
+    pub fn addr(&self) -> String {
+        lock(&self.listen).addr.clone()
     }
 
     fn serve(&self, mut req: Request) {
@@ -129,16 +245,26 @@ impl SettingsServer {
     }
 
     fn handle(&self, req: &mut Request) -> (u16, &'static str, Vec<u8>) {
-        // Host inattendu : requête forgée par un autre site (DNS rebinding).
-        if header(req, "Host").as_deref() != Some(self.addr.as_str()) {
-            return plain(403, "hôte refusé");
-        }
         let url = req.url().to_string();
         let path = url.split('?').next().unwrap_or("");
-        let prefix = format!("/{}/", self.token);
-        let Some(route) = path.strip_prefix(&prefix) else {
-            return plain(404, "introuvable");
+        let route = path.strip_prefix(&format!("/{}/", self.token));
+        let host = header(req, "Host");
+        let (addr, _active) = {
+            let mut l = lock(&self.listen);
+            let addr = l.addr.clone();
+            // Host inattendu : requête forgée par un autre site (DNS rebinding) ; port refermé.
+            if addr.is_empty() || host.as_deref() != Some(addr.as_str()) {
+                return plain(403, "hôte refusé");
+            }
+            if route.is_none() {
+                return plain(404, "introuvable");
+            }
+            // Requête de la page elle-même : elle garde le port ouvert jusqu'à sa fin.
+            l.active += 1;
+            l.last = Instant::now();
+            (addr, Activity(self))
         };
+        let route = route.unwrap_or_default();
 
         match route {
             "" | "api/config" | "api/status" => {
@@ -152,7 +278,7 @@ impl SettingsServer {
                     return plain(405, "méthode refusée");
                 }
                 if let Some(o) = header(req, "Origin") {
-                    if o != format!("http://{}", self.addr) {
+                    if o != format!("http://{addr}") {
                         return plain(403, "origine refusée");
                     }
                 }
@@ -178,6 +304,7 @@ impl SettingsServer {
                     o.remove("api_key_protected");
                     o.insert("has_key".into(), has_key.into());
                     o.insert("excluded_count".into(), hooks.map(|h| h.excluded()).unwrap_or(0).into());
+                    o.insert("portable".into(), self.portable.into()); // libellés des mises à jour
                 }
                 json_response(200, &v)
             }
@@ -322,7 +449,8 @@ mod tests {
         let fake = FakeImmich::start();
         let cfg_path = temp_dir("settings").join("config.json");
         write_default_config(&cfg_path).unwrap();
-        let s = SettingsServer::start(&cfg_path).unwrap();
+        let s = SettingsServer::new(&cfg_path).unwrap();
+        s.open().unwrap();
         let hooks = Arc::new(TestHooks::default());
         hooks.excluded.store(3, Ordering::SeqCst);
         s.set_hooks(hooks.clone());

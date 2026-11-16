@@ -1,6 +1,6 @@
 //! Tests exécutés sur un vrai Windows.
 
-use crate::win::app::retry_delay;
+use crate::win::app::{retry_delay, update_menu_label};
 use crate::win::context::{blocked, connection_cost, fullscreen_busy, metered_connection, on_battery};
 use crate::win::install::{same_path, uninstall_cmd_line, write_file_sync};
 use crate::win::platform::*;
@@ -96,6 +96,19 @@ fn portable_flavor() {
     assert!(same_path(&exe, &std::path::PathBuf::from(exe.to_string_lossy().to_uppercase())));
 }
 
+/// Fichier témoin portable.txt : l'exe de test n'en a pas, il garde ses données dans le profil.
+/// Version portable : la version trouvée est annoncée dans le menu, installée sur clic.
+#[test]
+fn portable_marker_and_update_menu() {
+    assert!(!crate::portable_by_marker(), "témoin inattendu à côté de l'exe de test");
+    assert_eq!(data_dir(), data_dir_for(crate::is_portable()));
+    assert_eq!(
+        update_menu_label(None),
+        format!("Rechercher une mise à jour (version {})", crate::VERSION)
+    );
+    assert_eq!(update_menu_label(Some("1.11.0")), "Installer la version 1.11.0…");
+}
+
 #[test]
 fn screen_and_monitors() {
     let sc = screen_for("fill");
@@ -156,6 +169,39 @@ fn app_end_to_end() {
     assert!(dir.join("excluded.json").exists() && dir.join("recent.json").exists());
 }
 
+/// Zip portable (exe classique + portable.txt à côté) : le fichier témoin rend la vraie appli
+/// portable, sans icône sur le bureau par défaut, et la page de réglages n'ouvre son port qu'à la
+/// demande (vérifié par le mode de vérification). Exécutable à tester : IW_APP_EXE.
+#[test]
+fn app_portable_marker() {
+    let Some(exe) = std::env::var_os("IW_APP_EXE") else {
+        eprintln!("IW_APP_EXE non défini : test ignoré");
+        return;
+    };
+    let dir = crate::testutil::temp_dir("e2e_portable");
+    let copy = dir.join("ImmichWallpaper.exe");
+    std::fs::copy(exe, &copy).unwrap();
+    std::fs::write(dir.join(crate::PORTABLE_MARKER), "portable").unwrap();
+    let data = dir.join("donnees");
+    let out = dir.join("result.txt");
+    let status = std::process::Command::new(&copy)
+        .arg("--selftest")
+        .arg(&out)
+        .arg("--selftest-dir")
+        .arg(&data)
+        .status()
+        .unwrap();
+    let report = std::fs::read_to_string(&out).unwrap_or_default();
+    let log = std::fs::read_to_string(data.join("journal.txt")).unwrap_or_default();
+    eprintln!("{report}");
+    assert!(
+        status.success() && report.starts_with("OK") && report.contains("portable=true"),
+        "{report}\n--- journal ---\n{log}"
+    );
+    let cfg = crate::config::read_config(&data.join("config.json")).unwrap();
+    assert!(!cfg.desktop_link, "version portable : pas d'icône sur le bureau par défaut");
+}
+
 /// TLS par Schannel face à un vrai serveur : vérification normale, puis épinglage du certificat.
 /// Demande un accès à Internet : lancé seulement avec IW_NET_TESTS=1.
 #[test]
@@ -183,6 +229,6 @@ fn tls_and_pinning() {
     let e = get(Some(wrong)).unwrap_err();
     assert!(e.contains("certificat"), "{e}");
     // Mise à jour : la release en ligne est lue et ses adresses sont acceptées.
-    let u = crate::update::check_update("0.0.1", &crate::update::asset_name("x86_64", false));
+    let u = crate::update::check_update("0.0.1", &crate::update::asset_name("x86_64", ""));
     assert!(matches!(u, Ok(Some(_))), "{u:?}");
 }

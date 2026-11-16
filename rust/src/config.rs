@@ -98,7 +98,8 @@ impl Default for Config {
             show_place: true,
             show_date: false,
             caption_position: "bottom-right".into(),
-            desktop_link: true,
+            // Portable : rien n'est déposé hors de son dossier sans le demander.
+            desktop_link: !crate::is_portable(),
             auto_update: true,
             multi_monitor: "same".into(),
             offline_cache: 40,

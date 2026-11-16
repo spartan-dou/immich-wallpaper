@@ -8,17 +8,13 @@ version n'a pas été validée à la main.
 
 - Mêmes fichiers de données (`config.json`, cache hors ligne, `recent.json`, `excluded.json`) :
   une installation existante est reprise telle quelle, clé API chiffrée (DPAPI) comprise.
-- Même page de réglages (`../settings.html`), même icône et même manifeste (`../rsrc_windows_*.syso`).
+- Même page de réglages (`../settings.html`), ouverte à la demande et refermée après 10 min
+  d'inactivité ; même icône et même manifeste (`../rsrc_windows_*.syso`).
 - Mêmes noms d'exécutables et même protocole de mise à jour (`--after-update`, retour arrière).
-- Mêmes variantes : classique, installeur (`IW_FLAVOR=setup`), portable (`IW_FLAVOR=portable`).
-
-## Pas encore repris de la version Go
-
-- Le zip portable de la v1.10 (exe classique + `portable.txt` à côté) : seule la variante
-  `IW_FLAVOR=portable` rend cette version portable.
-- Version portable : mises à jour annoncées dans le menu et installées sur clic seulement,
-  icône du bureau décochée par défaut.
-- Page de réglages ouverte à la demande et refermée après 10 min d'inactivité.
+- Mêmes variantes : classique, installeur (`IW_FLAVOR=setup`), portable (`IW_FLAVOR=portable`,
+  ou exe classique avec `portable.txt` à côté, comme dans le zip portable). En portable, les
+  mises à jour sont annoncées dans le menu et installées sur clic seulement, et l'icône du
+  bureau est décochée par défaut.
 
 ## Ce qui change
 

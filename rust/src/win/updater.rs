@@ -2,7 +2,7 @@
 //! retour arrière si la nouvelle version ne démarre pas.
 
 use crate::logf;
-use crate::update::{asset_name, check_update};
+use crate::update::{check_update, update_asset_name, update_plan, UpdatePlan};
 use crate::win::app::App;
 use crate::win::install::{has_arg, installed_exe, same_path, update_displayed_version, write_file_sync};
 use crate::win::platform::{confirm, data_dir, error, hidden_cmd, info, release_instance, single_instance};
@@ -149,7 +149,9 @@ fn run_update(app: &Arc<App>, manual: bool) {
     if !manual && !app.auto_update() {
         return;
     }
-    let u = match check_update(VERSION, &asset_name(std::env::consts::ARCH, is_portable())) {
+    // L'exe portable se met à jour avec l'exe portable ; le zip portable (exe classique +
+    // portable.txt) avec l'exe classique : le fichier témoin reste en place à côté.
+    let u = match check_update(VERSION, &update_asset_name()) {
         Ok(u) => u,
         Err(e) => {
             logf!("mise à jour : {e}");
@@ -165,17 +167,31 @@ fn run_update(app: &Arc<App>, manual: bool) {
         }
         return;
     };
-    if !manual && std::fs::read_to_string(skip_file()).map(|s| s.trim() == u.version).unwrap_or(false) {
-        logf!("version {} ignorée (échec au démarrage précédemment)", u.version);
-        return;
-    }
-    if manual
-        && !confirm(&format!(
-            "Version {} disponible (actuelle : {VERSION}).\n\nInstaller maintenant ? L'appli redémarrera.",
-            u.version
-        ))
-    {
-        return;
+    let skipped = !manual && std::fs::read_to_string(skip_file()).map(|s| s.trim() == u.version).unwrap_or(false);
+    match update_plan(manual, is_portable(), skipped) {
+        UpdatePlan::Skip => {
+            logf!("version {} ignorée (échec au démarrage précédemment)", u.version);
+            return;
+        }
+        // Version portable (PC professionnel, clé USB…) : rien n'est téléchargé ni remplacé
+        // sans un clic. La version trouvée est seulement annoncée dans le menu de l'icône.
+        UpdatePlan::Offer => {
+            logf!(
+                "version {} disponible : proposée dans le menu de l'icône, rien n'est téléchargé",
+                u.version
+            );
+            app.offer_update(&u.version);
+            return;
+        }
+        UpdatePlan::Confirm => {
+            if !confirm(&format!(
+                "Version {} disponible (actuelle : {VERSION}).\n\nInstaller maintenant ? L'appli redémarrera.",
+                u.version
+            )) {
+                return;
+            }
+        }
+        UpdatePlan::Install => {}
     }
     logf!("mise à jour {VERSION} → {} : téléchargement", u.version);
     app.set_status(&format!("Mise à jour vers {}…", u.version));

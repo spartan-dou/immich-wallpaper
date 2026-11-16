@@ -66,6 +66,9 @@ struct AppState {
     /// Pourquoi le changement automatique attend (batterie, plein écran…).
     hold: Option<&'static str>,
     pending: Option<PendingUpdate>,
+    /// Version portable : nouvelle version trouvée par la vérification quotidienne, installée
+    /// seulement sur clic dans le menu.
+    offered: Option<String>,
     has_photo: bool,
     /// Événement système en attente (regroupement sur 3 s).
     event: u8,
@@ -95,6 +98,15 @@ pub fn retry_delay(n: u32) -> Duration {
         d *= 2;
     }
     Duration::from_secs(d.min(30) * 60)
+}
+
+/// Libellé de l'entrée « mise à jour » du menu : une version annoncée (version portable)
+/// s'installe sur clic, après confirmation.
+pub fn update_menu_label(offered: Option<&str>) -> String {
+    match offered {
+        Some(v) => format!("Installer la version {v}…"),
+        None => format!("Rechercher une mise à jour (version {VERSION})"),
+    }
 }
 
 /// Remet le drapeau « occupé » à zéro en sortie de portée, même en cas de panic.
@@ -139,6 +151,11 @@ impl App {
 
     pub fn auto_update(&self) -> bool {
         lock(&self.st).cfg.as_ref().map(|c| c.auto_update).unwrap_or(true)
+    }
+
+    /// Annonce une nouvelle version dans le menu ; un clic lance la mise à jour (après confirmation).
+    pub fn offer_update(&self, version: &str) {
+        lock(&self.st).offered = Some(version.to_string());
     }
 
     // ---------- icône de la barre système ----------
@@ -428,9 +445,9 @@ impl App {
     // ---------- menu ----------
 
     fn build_menu(&self) -> HMENU {
-        let (status, paused, has_photo) = {
+        let (status, paused, has_photo, offered) = {
             let st = lock(&self.st);
-            (st.status.clone(), st.paused, st.has_photo)
+            (st.status.clone(), st.paused, st.has_photo, st.offered.clone())
         };
         unsafe {
             let m = CreatePopupMenu().unwrap_or_default();
@@ -455,7 +472,7 @@ impl App {
             item(M_PAUSE, "Pause", check(paused));
             item(M_AUTO, "Démarrer avec Windows", check(platform::autostart_enabled()));
             item(M_LOG, "Ouvrir le journal", MF_ENABLED);
-            item(M_UPDATE, &format!("Rechercher une mise à jour (version {VERSION})"), MF_ENABLED);
+            item(M_UPDATE, &update_menu_label(offered.as_deref()), MF_ENABLED);
             if !is_portable() {
                 item(M_UNINSTALL, "Désinstaller…", MF_ENABLED); // portable : il suffit de supprimer le dossier
             }
@@ -494,9 +511,13 @@ impl App {
         }
     }
 
+    /// Ouvre la page de réglages dans le navigateur (et son port s'il était fermé).
     fn open_settings(&self) {
         if let Some(s) = self.settings.get() {
-            shell_open(&s.url());
+            match s.open() {
+                Ok(u) => shell_open(&u),
+                Err(e) => platform::error(&format!("Impossible d'ouvrir la page de réglages : {e}")),
+            }
         }
     }
 
@@ -764,7 +785,12 @@ fn selftest_report(app: &Arc<App>, out: PathBuf) {
             .map_err(|e| e.to_string())
             .and_then(|r| r.into_string().map_err(|e| e.to_string()))
     };
-    let url = app.settings.get().map(|s| s.url()).unwrap_or_default();
+    // La page n'ouvre son port qu'à la demande : fermé au démarrage, ouvert ici comme depuis le menu.
+    check(
+        app.settings.get().is_some_and(|s| s.url().is_empty()),
+        "port de la page de réglages ouvert sans demande",
+    );
+    let url = app.settings.get().and_then(|s| s.open().ok()).unwrap_or_default();
     check(
         matches!(get(url.clone()), Ok(p) if p.contains("Immich Wallpaper")),
         "page de réglages inaccessible",
@@ -949,6 +975,7 @@ pub fn run() {
             failures: 0,
             hold: None,
             pending: None,
+            offered: None,
             has_photo: false,
             event: 0,
         }),
@@ -961,13 +988,14 @@ pub fn run() {
     });
     let _ = APP.set(app.clone());
 
-    match SettingsServer::start(&app.cfg_path) {
+    // La page de réglages n'ouvre son port (127.0.0.1) qu'à la demande.
+    match SettingsServer::new(&app.cfg_path) {
         Ok(s) => {
             s.set_hooks(Arc::new(app.clone()));
             let _ = app.settings.set(s);
         }
         Err(e) => {
-            platform::error(&format!("Impossible de démarrer la page de réglages : {e}"));
+            platform::error(&format!("Impossible de préparer la page de réglages : {e}"));
             return;
         }
     }
@@ -1005,6 +1033,9 @@ pub fn run() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+    if let Some(s) = app.settings.get() {
+        s.close();
     }
     logf!("--- arrêt");
     let pending = lock(&app.st).pending.take();

@@ -55,14 +55,47 @@ pub fn newer_version(latest: &str, current: &str) -> bool {
     matches!((parse_version(latest), parse_version(current)), (Some(l), Some(c)) if l > c)
 }
 
-/// Fichier de release à télécharger pour se mettre à jour. La version portable se met à jour
-/// avec la version portable ; les copies installées (quelle que soit leur origine) avec l'exe classique.
-pub fn asset_name(arch: &str, portable: bool) -> String {
+/// Fichier de release à télécharger pour se mettre à jour. L'exe portable (`flavor` =
+/// "portable") se met à jour avec l'exe portable ; les copies installées (quelle que soit leur
+/// origine) et le zip portable (exe classique + portable.txt) avec l'exe classique.
+pub fn asset_name(arch: &str, flavor: &str) -> String {
     let arch = if arch == "aarch64" || arch == "arm64" { "arm64" } else { "x64" };
-    if portable {
+    if flavor == "portable" {
         format!("ImmichWallpaper-portable-{arch}.exe")
     } else {
         format!("ImmichWallpaper-{arch}.exe")
+    }
+}
+
+/// Fichier de release qui met à jour l'exe en cours (selon sa variante, pas le fichier témoin).
+pub fn update_asset_name() -> String {
+    asset_name(std::env::consts::ARCH, crate::FLAVOR)
+}
+
+/// Ce que fait une vérification qui a trouvé une nouvelle version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePlan {
+    /// Vérification automatique d'une version qui a déjà échoué au démarrage : rien.
+    Skip,
+    /// Vérification automatique de la version portable (PC professionnel, clé USB…) : la
+    /// version est seulement annoncée dans le menu de l'icône, rien n'est téléchargé.
+    Offer,
+    /// Clic dans le menu : confirmation, puis téléchargement et remplacement de l'exe.
+    Confirm,
+    /// Vérification automatique d'une copie non portable : installation sans question.
+    Install,
+}
+
+/// manual : clic dans le menu ; skipped : version qui a échoué au démarrage précédemment.
+pub fn update_plan(manual: bool, portable: bool, skipped: bool) -> UpdatePlan {
+    if manual {
+        UpdatePlan::Confirm
+    } else if skipped {
+        UpdatePlan::Skip
+    } else if portable {
+        UpdatePlan::Offer
+    } else {
+        UpdatePlan::Install
     }
 }
 
@@ -199,10 +232,11 @@ mod tests {
         ] {
             assert_eq!(newer_version(l, c), want, "{l} vs {c}");
         }
-        assert_eq!(asset_name("x86_64", false), "ImmichWallpaper-x64.exe");
-        assert_eq!(asset_name("aarch64", false), "ImmichWallpaper-arm64.exe");
-        assert_eq!(asset_name("x86_64", true), "ImmichWallpaper-portable-x64.exe");
-        assert_eq!(asset_name("aarch64", true), "ImmichWallpaper-portable-arm64.exe");
+        assert_eq!(asset_name("x86_64", ""), "ImmichWallpaper-x64.exe");
+        assert_eq!(asset_name("aarch64", ""), "ImmichWallpaper-arm64.exe");
+        assert_eq!(asset_name("x86_64", "setup"), "ImmichWallpaper-x64.exe");
+        assert_eq!(asset_name("x86_64", "portable"), "ImmichWallpaper-portable-x64.exe");
+        assert_eq!(asset_name("aarch64", "portable"), "ImmichWallpaper-portable-arm64.exe");
     }
 
     #[test]
@@ -223,7 +257,7 @@ mod tests {
         let mut bin = b"MZ".to_vec();
         bin.extend(std::iter::repeat(b'x').take(1000));
         let sum = sha256_hex(&bin);
-        let name = asset_name("x86_64", false);
+        let name = asset_name("x86_64", "");
         let corrupt = Arc::new(AtomicBool::new(false));
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.server_addr());
@@ -265,6 +299,6 @@ mod tests {
         let e = check_update_at(&api, &update_asset_prefix(), "1.4.0", &name).unwrap_err();
         assert!(e.to_string().contains("inattendue"), "{e}");
         // Exe d'une autre variante absent de la release : release incomplète.
-        assert!(check_update_at(&api, &prefix, "1.4.0", &asset_name("x86_64", true)).is_err());
+        assert!(check_update_at(&api, &prefix, "1.4.0", &asset_name("x86_64", "portable")).is_err());
     }
 }
