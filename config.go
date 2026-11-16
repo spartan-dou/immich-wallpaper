@@ -61,7 +61,7 @@ func defaultConfig() Config {
 		ChangeOnStart:   true,
 		ShowPlace:       true,
 		CaptionPosition: "bottom-right",
-		DesktopLink:     true,
+		DesktopLink:     !isPortable(), // portable : rien n'est déposé hors de son dossier sans le demander
 		AutoUpdate:      true,
 		MultiMonitor:    "same",
 		OfflineCache:    40,

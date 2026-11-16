@@ -220,7 +220,20 @@ $t2 = $asAct.Invoke($null, @([Windows.System.UserProfile.LockScreen]::SetImageFi
 $t2.Wait(-1) | Out-Null
 `
 
+// setLockScreen applique l'image à l'écran de verrouillage par un appel direct à WinRT. La
+// version portable ne lance jamais PowerShell : sur un PC géré, un PowerShell caché lancé par
+// un exe inconnu fait réagir l'antivirus. Les autres versions gardent le script en secours,
+// seulement si l'API n'a pas pu être appelée (pas si Windows a refusé l'image).
 func setLockScreen(path string) error {
+	err := setLockScreenNative(path)
+	if err == nil || !errors.Is(err, errWinRTUnavailable) || isPortable() {
+		return err
+	}
+	log.Printf("écran de verrouillage : %v ; nouvel essai par PowerShell", err)
+	return setLockScreenPS(path)
+}
+
+func setLockScreenPS(path string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, powershellExe(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", lockScreenPS)

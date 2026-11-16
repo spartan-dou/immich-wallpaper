@@ -42,6 +42,7 @@ type App struct {
 	pending  *pendingUpdate
 	mStatus  *systray.MenuItem
 	mOpenPic *systray.MenuItem
+	mUpdate  *systray.MenuItem
 }
 
 func main() {
@@ -96,9 +97,10 @@ func main() {
 	a.core.setMonitorWallpapers = setMonitorWallpapers
 	a.core.afterApply = updateDesktopLink
 	var err error
-	a.settings, err = startSettingsServer(a.cfgPath)
+	// La page de réglages n'ouvre son port (127.0.0.1) qu'à la demande.
+	a.settings, err = newSettingsServer(a.cfgPath)
 	if err != nil {
-		msgBox("Immich Wallpaper", "Impossible de démarrer la page de réglages : "+err.Error(), mbIconError)
+		msgBox("Immich Wallpaper", "Impossible de préparer la page de réglages : "+err.Error(), mbIconError)
 		return
 	}
 	a.settings.OnSaved = func(c *Config) { a.applyConfig(c, false) }
@@ -113,7 +115,10 @@ func main() {
 	a.settings.Excluded = a.core.ExcludedCount
 	a.settings.OnClearExcluded = a.core.ClearExcluded
 
-	systray.Run(a.onReady, func() { log.Printf("--- arrêt") })
+	systray.Run(a.onReady, func() {
+		a.settings.Close()
+		log.Printf("--- arrêt")
+	})
 	if a.pending != nil {
 		a.pending.watch() // surveille le démarrage de la nouvelle version (retour arrière si plantage)
 	}
@@ -345,6 +350,7 @@ func (a *App) onReady() {
 	mAuto := systray.AddMenuItemCheckbox("Démarrer avec Windows", "", autostartEnabled())
 	mLog := systray.AddMenuItem("Ouvrir le journal", "")
 	mUpdate := systray.AddMenuItem("Rechercher une mise à jour", "Version actuelle : "+appVersion)
+	a.mUpdate = mUpdate
 	mUninstall := systray.AddMenuItem("Désinstaller…", "Tout supprimer (programme, réglages, démarrage auto)")
 	if isPortable() {
 		mUninstall.Hide() // rien d'installé : il suffit de supprimer le dossier
@@ -380,7 +386,7 @@ func (a *App) onReady() {
 	} else {
 		log.Printf("config incomplète : %v", err)
 		a.setStatus("Configuration à compléter")
-		shellOpen(a.settings.URL())
+		a.openSettings()
 	}
 
 	go a.updateLoop()
@@ -438,7 +444,7 @@ func (a *App) onReady() {
 					shellOpen(u)
 				}
 			case <-mSettings.ClickedCh:
-				shellOpen(a.settings.URL())
+				a.openSettings()
 			case <-mPause.ClickedCh:
 				a.mu.Lock()
 				a.paused = !a.paused
@@ -476,6 +482,16 @@ func (a *App) onReady() {
 			}
 		}
 	}()
+}
+
+// openSettings ouvre la page de réglages dans le navigateur (et son port s'il était fermé).
+func (a *App) openSettings() {
+	u, err := a.settings.Open()
+	if err != nil {
+		msgBox("Immich Wallpaper", "Impossible d'ouvrir la page de réglages : "+err.Error(), mbIconError)
+		return
+	}
+	shellOpen(u)
 }
 
 func hasArg(name string) bool {

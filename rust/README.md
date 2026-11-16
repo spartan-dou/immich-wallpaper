@@ -12,6 +12,14 @@ version n'a pas été validée à la main.
 - Mêmes noms d'exécutables et même protocole de mise à jour (`--after-update`, retour arrière).
 - Mêmes variantes : classique, installeur (`IW_FLAVOR=setup`), portable (`IW_FLAVOR=portable`).
 
+## Pas encore repris de la version Go
+
+- Le zip portable de la v1.10 (exe classique + `portable.txt` à côté) : seule la variante
+  `IW_FLAVOR=portable` rend cette version portable.
+- Version portable : mises à jour annoncées dans le menu et installées sur clic seulement,
+  icône du bureau décochée par défaut.
+- Page de réglages ouverte à la demande et refermée après 10 min d'inactivité.
+
 ## Ce qui change
 
 - L'icône de la barre système, le menu et les événements (déverrouillage, écrans, veille)
