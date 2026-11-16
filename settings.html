@@ -181,7 +181,8 @@
 
   <section>
     <h2>Mises à jour</h2>
-    <label class="check" style="margin-top:0"><input type="checkbox" id="auto_update"> Installer automatiquement les nouvelles versions publiées sur GitHub</label>
+    <label class="check" style="margin-top:0"><input type="checkbox" id="auto_update"> <span id="auto_update_label">Installer automatiquement les nouvelles versions publiées sur GitHub</span></label>
+    <div class="hint" id="auto_update_portable" hidden>Version portable : une nouvelle version est seulement annoncée dans le menu de l'icône (« Installer la version… ») ; rien n'est téléchargé ni remplacé sans ton accord. Décoché, l'appli ne contacte plus GitHub d'elle-même.</div>
     <div class="hint">Vérification au démarrage puis une fois par jour. Téléchargement depuis les releases GitHub du projet uniquement ; l'empreinte SHA256 détecte un fichier corrompu (les releases ne sont pas signées).</div>
   </section>
 
@@ -330,6 +331,10 @@ async function load() {
   $('lock_screen').checked = !!c.lock_screen;
   $('desktop_link').checked = c.desktop_link !== false;
   $('auto_update').checked = c.auto_update !== false;
+  if (c.portable) {
+    $('auto_update_label').textContent = 'Vérifier chaque jour si une nouvelle version est publiée sur GitHub';
+    $('auto_update_portable').hidden = false;
+  }
   $('multi_monitor').value = c.multi_monitor || 'same';
   $('split_wide').checked = c.split_wide !== false;
   $('change_on_unlock').checked = c.change_on_unlock !== false;
@@ -359,9 +364,17 @@ async function testConn(quiet) {
   b.disabled = false;
 }
 
+// La page ne garde le port ouvert que tant qu'elle sert : pas d'interrogation quand l'onglet
+// est caché. Fermée après 10 min d'inactivité, elle se rouvre depuis l'icône.
 async function refreshStatus() {
-  try { $('status').textContent = (await api('api/status')).status || ''; } catch (e) {}
+  if (document.hidden) return;
+  try { $('status').textContent = (await api('api/status')).status || ''; }
+  catch (e) {
+    if (e instanceof TypeError) // pas de réponse : le port a été refermé
+      $('status').textContent = 'Page fermée après inactivité : rouvre « Paramètres… » depuis l\'icône près de l\'horloge.';
+  }
 }
+document.addEventListener('visibilitychange', refreshStatus);
 
 $('test').onclick = () => testConn(false);
 $('filter').oninput = render;

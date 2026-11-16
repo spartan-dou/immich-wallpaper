@@ -190,6 +190,13 @@ func (a *App) checkAndUpdate(manual bool) {
 		}
 		return
 	}
+	// Version portable (PC professionnel, clé USB…) : rien n'est téléchargé ni remplacé sans
+	// un clic. La version trouvée est seulement annoncée dans le menu de l'icône.
+	if !manual && isPortable() {
+		log.Printf("version %s disponible : proposée dans le menu de l'icône, rien n'est téléchargé", u.Version)
+		a.offerUpdate(u.Version)
+		return
+	}
 	if manual && !confirm("Version "+u.Version+" disponible (actuelle : "+appVersion+").\n\nInstaller maintenant ? L'appli redémarrera.") {
 		return
 	}
@@ -222,6 +229,15 @@ func (a *App) checkAndUpdate(manual bool) {
 	}
 	a.pending = &pendingUpdate{self: self, version: u.Version, cmd: cmd}
 	systray.Quit()
+}
+
+// offerUpdate annonce une nouvelle version dans le menu ; un clic lance la mise à jour
+// (après confirmation).
+func (a *App) offerUpdate(version string) {
+	if a.mUpdate != nil {
+		a.mUpdate.SetTitle("Installer la version " + version + "…")
+		a.mUpdate.SetTooltip("Version actuelle : " + appVersion + ". Rien n'est installé sans ton accord.")
+	}
 }
 
 // updateLoop : première vérification 2 min après le démarrage, puis une fois par jour.

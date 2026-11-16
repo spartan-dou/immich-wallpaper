@@ -80,15 +80,15 @@ func newerVersion(latest, current string) bool {
 	return false
 }
 
-// assetName : fichier de release à télécharger pour se mettre à jour. La version portable se
-// met à jour avec la version portable ; les copies installées (quelle que soit leur origine)
-// avec l'exe classique.
+// assetName : fichier de release à télécharger pour se mettre à jour. L'exe portable se
+// met à jour avec l'exe portable ; les copies installées (quelle que soit leur origine) et le
+// zip portable (exe classique + portable.txt) avec l'exe classique.
 func assetName(goarch string) string {
 	arch := "x64"
 	if goarch == "arm64" {
 		arch = "arm64"
 	}
-	if isPortable() {
+	if flavor == "portable" {
 		return "ImmichWallpaper-portable-" + arch + ".exe"
 	}
 	return "ImmichWallpaper-" + arch + ".exe"

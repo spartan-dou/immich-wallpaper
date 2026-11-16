@@ -7,9 +7,9 @@ Petite appli Windows (barre système) qui met en fond d'écran — et, en option
 | Version | Fichier | Pour qui |
 |---|---|---|
 | **Installeur** | `ImmichWallpaper-setup-x64.exe` / `-setup-arm64.exe` | Usage normal : s'installe, se lance avec Windows, se désinstalle depuis les paramètres de Windows. |
-| **Portable** | `ImmichWallpaper-portable-x64.exe` / `-portable-arm64.exe` | Sans installation : l'exe et ses données restent dans le dossier où tu le poses (clé USB, dossier personnel…). |
+| **Portable** | `ImmichWallpaper-portable-x64.zip` / `-portable-arm64.zip` | Sans installation, PC professionnel compris : à dézipper où tu veux, tout reste dans ce dossier (voir [PC professionnel](#pc-professionnel)). |
 
-Les fichiers `ImmichWallpaper-x64.exe` / `-arm64.exe` sont l'exe classique : c'est lui que la mise à jour automatique des copies installées télécharge. Lancé à la main, il propose de s'installer ou de tourner sans installation.
+Les fichiers `ImmichWallpaper-x64.exe` / `-arm64.exe` sont l'exe classique : c'est lui que la mise à jour automatique des copies installées télécharge. Lancé à la main, il propose de s'installer ou de tourner sans installation. `ImmichWallpaper-portable-x64.exe` / `-arm64.exe` est l'ancienne version portable en un seul exe ; elle reste publiée pour les copies existantes et se comporte comme le zip.
 
 ## Installation
 
@@ -27,17 +27,40 @@ Installation sans question (déploiement automatisé) : `ImmichWallpaper-setup-x
 
 ### Version portable
 
-1. Pose `ImmichWallpaper-portable-x64.exe` dans un dossier où tu peux écrire, puis lance-le.
+1. Dézippe `ImmichWallpaper-portable-x64.zip` dans un dossier où tu peux écrire (Documents, clé USB…), puis lance `ImmichWallpaper.exe`.
 2. La page de réglages s'ouvre, comme ci-dessus.
+
+Le fichier `portable.txt` à côté de l'exe indique à l'appli de ne rien installer (comme dans [omnictl](https://github.com/spartan-dou/omnictl)) ; il décrit aussi tout ce qu'elle fait sur le PC. Le supprimer rend l'appli « normale » : elle propose alors de s'installer.
 
 Ce qui change par rapport à la version installée :
 
 - Les réglages, le journal, le cache et les images sont dans le dossier `ImmichWallpaper-data` à côté de l'exe ; rien n'est écrit dans `%APPDATA%`.
 - Rien n'est installé : ni raccourci, ni entrée dans les applications de Windows. Pour la retirer, quitte l'appli et supprime le dossier.
+- Rien n'est posé sur le bureau par défaut : l'icône « Voir cette photo dans Immich » est décochée (à cocher dans les réglages si tu la veux).
 - « Démarrer avec Windows » reste possible depuis le menu de l'icône (décoché par défaut) ; pense à le décocher avant de supprimer ou déplacer le dossier.
-- La mise à jour automatique remplace l'exe portable par la nouvelle version portable.
+- **Mises à jour sur clic seulement** : une nouvelle version est annoncée dans le menu de l'icône (« Installer la version… ») ; rien n'est téléchargé ni remplacé sans ce clic et une confirmation.
 - La clé API est chiffrée pour ton compte Windows sur ce PC : sur un autre PC ou un autre compte, il faut la ressaisir.
 - Une seule instance tourne à la fois : la version portable ne se lance pas si la version installée est déjà en cours d'exécution.
+
+### PC professionnel
+
+La version portable est faite pour tourner sur un PC géré par un service informatique sans rien y installer ni déclencher l'antivirus. Ce qu'elle fait, et ne fait pas (détail dans `portable.txt`, à transmettre au besoin) :
+
+| | |
+|---|---|
+| Droits | ceux de l'utilisateur, jamais d'administrateur ; ni service, ni pilote, ni tâche planifiée |
+| Programmes lancés | aucun : ni PowerShell, ni cmd, ni script. L'écran de verrouillage passe par l'API de Windows (WinRT), dans le processus de l'appli |
+| Fichiers | uniquement dans son dossier ; rien sur le bureau par défaut |
+| Registre | `HKCU` seulement : réglages du fond d'écran (comme *Paramètres → Personnalisation*) ; entrée `Run` uniquement si « Démarrer avec Windows » est coché |
+| Réseau | en sortie, HTTPS vérifié par Windows (inspection TLS de l'entreprise comprise) : ton serveur Immich, et `api.github.com` une fois par jour pour annoncer une nouvelle version (désactivable) |
+| Port local | page de réglages sur `127.0.0.1` seulement quand tu l'ouvres, refermée après 10 min sans utilisation |
+| Mises à jour | jamais automatiques : sur clic, fichier vérifié par son empreinte SHA-256 |
+
+À savoir :
+
+- **L'exe n'est pas signé.** Au premier lancement, SmartScreen affiche « Windows a protégé votre ordinateur » : *Informations complémentaires → Exécuter quand même*. Si le PC n'autorise que les programmes approuvés (AppLocker, WDAC, Smart App Control), aucune version ne pourra s'y lancer sans l'accord du service informatique. Chaque fichier publié a une attestation de provenance vérifiable : `gh attestation verify ImmichWallpaper.exe --repo spartan-dou/immich-wallpaper`.
+- **Le serveur Immich doit être joignable depuis le PC.** L'appli ne passe pas par le proxy configuré dans Windows (seulement par les variables `HTTPS_PROXY` / `NO_PROXY`) : derrière un proxy obligatoire, elle reste sur les photos du cache hors ligne.
+- **Écran de verrouillage** : souvent imposé par l'entreprise sur un PC géré. Dans ce cas l'option échoue proprement (motif dans le journal) et seul le bureau change.
 
 ## Plusieurs écrans et mode hors ligne
 
@@ -50,6 +73,8 @@ Ce qui change par rapport à la version installée :
 ## Mises à jour automatiques
 
 L'appli vérifie les [releases](../../releases) de ce dépôt 2 min après le démarrage puis une fois par jour. Si une version plus récente existe, elle télécharge l'exe de son architecture, vérifie son empreinte avec `SHA256SUMS.txt`, se remplace (le nouvel exe est écrit à côté puis mis en place par renommage ; l'exe en cours devient `.old`, Windows interdisant de l'écraser) et redémarre. Seuls les fichiers des releases de ce dépôt sont acceptés (adresse et redirections contrôlées). L'empreinte protège contre un téléchargement corrompu, pas contre une compromission du dépôt : les releases ne sont pas signées. L'ancienne version surveille le démarrage de la nouvelle : si celle-ci s'arrête dans les premières secondes, elle se remet en place et cette version est ignorée par les mises à jour automatiques. Désactivable dans les réglages ; menu de l'icône → **Rechercher une mise à jour** pour forcer la vérification.
+
+**Version portable** : rien n'est installé sans toi. La vérification quotidienne annonce seulement la nouvelle version dans le menu de l'icône (« Installer la version… ») ; le téléchargement et le remplacement n'ont lieu qu'après ce clic et une confirmation. Le zip portable se met à jour avec l'exe classique, l'ancien exe portable avec l'exe portable.
 
 ## Désinstallation
 
@@ -75,7 +100,7 @@ La clé est chiffrée dans `config.json` avec DPAPI (`api_key_protected`, lisibl
 - **Ne plus afficher cette photo** : la masque et passe à la suivante. La liste est locale (`excluded.json`), rien n'est modifié dans Immich ; la page de réglages indique le nombre de photos masquées et permet de les réafficher.
 
 Avec plusieurs photos affichées (plusieurs écrans, écran très large), ces actions portent sur celle de l'écran principal.
-- **Paramètres…** : rouvre la page de réglages (servie localement sur 127.0.0.1, protégée par un jeton aléatoire, le token Immich n'y est jamais réaffiché).
+- **Paramètres…** : rouvre la page de réglages (servie localement sur 127.0.0.1, protégée par un jeton aléatoire, le token Immich n'y est jamais réaffiché). Le port n'est ouvert qu'à la demande et se referme après 10 min sans utilisation (onglet fermé ou caché) : il suffit alors de rouvrir la page depuis l'icône.
 - **Pause**, **Démarrer avec Windows**, **Ouvrir le journal**.
 - **Rechercher une mise à jour** : vérifie tout de suite et propose l'installation.
 - **Désinstaller…** : supprime le programme, ses réglages et le démarrage automatique.
@@ -93,7 +118,7 @@ Réglages → **Planification**. Ces réglages ne concernent que les changements
 ## Légende et écran de verrouillage
 
 - **Lieu / date** : carte façon verre dépoli (fond flouté, coins arrondis) incrustée sur l'image (ville, région, pays déduits du GPS par Immich ; rien si la photo n'est pas géolocalisée). L'image est alors recadrée par l'appli à la résolution de l'écran principal pour que le texte ne soit jamais rogné.
-- **Écran de verrouillage** : option à cocher. Dans Windows, *Personnalisation → Écran de verrouillage → Personnaliser* doit être sur « Image ». En cas d'échec, le motif est dans le journal.
+- **Écran de verrouillage** : option à cocher. Dans Windows, *Personnalisation → Écran de verrouillage → Personnaliser* doit être sur « Image ». L'image est appliquée par l'API de Windows (`Windows.System.UserProfile.LockScreen`), sans lancer PowerShell ; seules les versions installées gardent PowerShell en secours si cette API est indisponible. En cas d'échec, le motif est dans le journal (accès refusé : l'écran de verrouillage est probablement imposé par une stratégie).
 - L'appli repasse automatiquement l'arrière-plan du bureau en mode « Image » si « Windows à la une » ou un diaporama était actif.
 
 ## Ouvrir la photo dans Immich
@@ -145,10 +170,12 @@ Les fichiers `rsrc_windows_*.syso` contiennent l'icône et le manifeste (DPI, co
 | `schedule.go` | plage horaire, règles d'albums par saison/heure |
 | `context_windows.go` | batterie, plein écran, connexion limitée |
 | `win_windows.go`, `install_windows.go` | API Windows, installation/désinstallation |
+| `lockscreen_windows.go` | écran de verrouillage par WinRT, sans PowerShell |
+| `packaging/portable.txt` | fichier témoin du zip portable (et ce que fait l'appli sur le PC) |
 | `monitors_windows.go` | une image par écran (COM `IDesktopWallpaper`) |
 | `events_windows.go` | déverrouillage, changements d'écran, sortie de veille |
 | `update.go`, `update_windows.go` | mise à jour depuis les releases GitHub |
-| `version.go` | version (injectée par la pipeline à partir du tag) |
+| `version.go` | version (injectée par la pipeline à partir du tag), variante, détection de `portable.txt` |
 
 ### Publier une version
 

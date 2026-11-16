@@ -17,12 +17,25 @@ import (
 //go:embed settings.html
 var settingsHTML []byte
 
-// SettingsServer sert la page de réglages sur 127.0.0.1, protégée par un jeton aléatoire dans l'URL.
+// settingsIdle : la page de réglages s'arrête après ce délai sans requête. Ouverte, elle
+// interroge l'état toutes les 5 s (seulement quand l'onglet est visible) : le port ne reste
+// donc ouvert que pendant que la page sert, pas en permanence.
+const settingsIdle = 10 * time.Minute
+
+// SettingsServer sert la page de réglages sur 127.0.0.1, protégée par un jeton aléatoire dans
+// l'URL. Le port n'est ouvert qu'à la demande (Open) et se referme après inactivité.
 type SettingsServer struct {
 	cfgPath string
 	token   string
-	addr    string
-	mu      sync.Mutex
+	idle    time.Duration
+
+	lmu    sync.Mutex // état de l'écoute
+	addr   string     // "" : fermée
+	srv    *http.Server
+	last   time.Time // dernière requête valide
+	active int       // requêtes en cours (« Image suivante » peut durer)
+
+	mu sync.Mutex
 	// Empreinte du certificat vu lors du dernier test réussi, par URL de serveur
 	// (option « certificat auto-signé ») : c'est elle qui est épinglée à l'enregistrement.
 	seenPins map[string]string
@@ -34,39 +47,110 @@ type SettingsServer struct {
 	OnClearExcluded func() error // les réautorise toutes
 }
 
-func startSettingsServer(cfgPath string) (*SettingsServer, error) {
+// newSettingsServer prépare la page de réglages sans ouvrir de port.
+func newSettingsServer(cfgPath string) (*SettingsServer, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return nil, err
 	}
-	s := &SettingsServer{cfgPath: cfgPath, token: hex.EncodeToString(b), seenPins: map[string]string{}}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	return &SettingsServer{cfgPath: cfgPath, token: hex.EncodeToString(b), idle: settingsIdle, seenPins: map[string]string{}}, nil
+}
+
+// startSettingsServer prépare la page et ouvre tout de suite son port.
+func startSettingsServer(cfgPath string) (*SettingsServer, error) {
+	s, err := newSettingsServer(cfgPath)
 	if err != nil {
 		return nil, err
 	}
-	s.addr = ln.Addr().String()
-	srv := &http.Server{
-		Handler:           s,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    64 << 10,
-		// Pas de WriteTimeout : « Image suivante » répond à la fin du téléchargement.
+	if _, err := s.Open(); err != nil {
+		return nil, err
 	}
-	go func() {
-		if err := srv.Serve(ln); err != nil {
-			log.Printf("page de réglages arrêtée : %v", err)
-		}
-	}()
 	return s, nil
 }
 
-func (s *SettingsServer) URL() string { return "http://" + s.addr + "/" + s.token + "/" }
+// Open ouvre le port de la page s'il est fermé et renvoie l'adresse à ouvrir dans le navigateur.
+func (s *SettingsServer) Open() (string, error) {
+	s.lmu.Lock()
+	defer s.lmu.Unlock()
+	s.last = time.Now()
+	if s.srv == nil {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return "", err
+		}
+		srv := &http.Server{
+			Handler:           s,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+			MaxHeaderBytes:    64 << 10,
+			// Pas de WriteTimeout : « Image suivante » répond à la fin du téléchargement.
+		}
+		s.srv, s.addr = srv, ln.Addr().String()
+		go func() {
+			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("page de réglages arrêtée : %v", err)
+			}
+		}()
+		if s.idle > 0 {
+			go s.closeWhenIdle(srv)
+		}
+	}
+	return s.urlLocked(), nil
+}
+
+// closeWhenIdle referme le port quand la page ne sert plus (onglet fermé ou caché).
+func (s *SettingsServer) closeWhenIdle(srv *http.Server) {
+	t := time.NewTicker(min(s.idle/4, time.Minute))
+	defer t.Stop()
+	for range t.C {
+		s.lmu.Lock()
+		if s.srv != srv {
+			s.lmu.Unlock()
+			return
+		}
+		if s.active > 0 || time.Since(s.last) < s.idle {
+			s.lmu.Unlock()
+			continue
+		}
+		s.srv, s.addr = nil, ""
+		s.lmu.Unlock()
+		srv.Close()
+		log.Printf("page de réglages fermée après inactivité (plus aucun port ouvert)")
+		return
+	}
+}
+
+// Close referme le port de la page.
+func (s *SettingsServer) Close() {
+	s.lmu.Lock()
+	srv := s.srv
+	s.srv, s.addr = nil, ""
+	s.lmu.Unlock()
+	if srv != nil {
+		srv.Close()
+	}
+}
+
+// URL : adresse de la page ("" si son port est fermé).
+func (s *SettingsServer) URL() string {
+	s.lmu.Lock()
+	defer s.lmu.Unlock()
+	return s.urlLocked()
+}
+
+func (s *SettingsServer) urlLocked() string {
+	if s.addr == "" {
+		return ""
+	}
+	return "http://" + s.addr + "/" + s.token + "/"
+}
 
 type uiConfig struct {
 	Config
 	HasKey        bool `json:"has_key"`
 	ExcludedCount int  `json:"excluded_count"`
+	Portable      bool `json:"portable"` // la page adapte ses libellés (mises à jour sur clic)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -83,8 +167,11 @@ func writeErr(w http.ResponseWriter, err error) {
 const maxSettingsBody = 1 << 20
 
 func (s *SettingsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.lmu.Lock()
+	addr := s.addr
+	s.lmu.Unlock()
 	// Host inattendu : requête forgée par un autre site (DNS rebinding).
-	if r.Host != s.addr {
+	if addr == "" || r.Host != addr {
 		http.Error(w, "hôte refusé", http.StatusForbidden)
 		return
 	}
@@ -93,6 +180,17 @@ func (s *SettingsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Requête de la page elle-même : elle garde le port ouvert.
+	s.lmu.Lock()
+	s.active++
+	s.last = time.Now()
+	s.lmu.Unlock()
+	defer func() {
+		s.lmu.Lock()
+		s.active--
+		s.last = time.Now()
+		s.lmu.Unlock()
+	}()
 	h := w.Header()
 	h.Set("Cache-Control", "no-store")
 	h.Set("Referrer-Policy", "no-referrer")
@@ -114,7 +212,7 @@ func (s *SettingsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "méthode refusée", http.StatusMethodNotAllowed)
 			return
 		}
-		if o := r.Header.Get("Origin"); o != "" && o != "http://"+s.addr {
+		if o := r.Header.Get("Origin"); o != "" && o != "http://"+addr {
 			http.Error(w, "origine refusée", http.StatusForbidden)
 			return
 		}
@@ -142,7 +240,7 @@ func (s *SettingsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.Excluded != nil {
 			excluded = s.Excluded()
 		}
-		writeJSON(w, 200, uiConfig{cfg, hasKey, excluded})
+		writeJSON(w, 200, uiConfig{cfg, hasKey, excluded, isPortable()})
 	case "api/albums":
 		var in Config
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {

@@ -1,0 +1,63 @@
+Immich Wallpaper - version portable
+===================================
+
+Tant que ce fichier est a cote de ImmichWallpaper.exe, l'application n'installe rien :
+reglages, journal, cache et images restent dans le dossier "ImmichWallpaper-data" ici meme.
+Le dossier peut vivre dans tes documents ou sur une cle USB.
+
+Pour la retirer : icone pres de l'horloge -> Quitter, puis supprimer le dossier.
+Supprimer ce fichier rend l'application "normale" (elle propose alors de s'installer).
+
+
+Ce que l'application fait sur le PC
+-----------------------------------
+
+Droits
+  Ceux de l'utilisateur, jamais d'administrateur (manifeste "asInvoker").
+  Ni service, ni pilote, ni tache planifiee, ni extension du navigateur.
+
+Programmes lances
+  Aucun : ni PowerShell, ni cmd, ni script. L'ecran de verrouillage passe par l'API
+  de Windows (WinRT LockScreen) dans le processus de l'application.
+  Seuls s'ouvrent, a la demande et par le shell de Windows : le navigateur (page de
+  reglages, photo dans Immich) et l'editeur de texte (journal). Apres une mise a jour
+  acceptee, l'application se relance elle-meme dans sa nouvelle version.
+
+Fichiers
+  Uniquement dans ce dossier. Rien sur le bureau par defaut : l'icone "Voir cette
+  photo dans Immich" ne s'y pose que si elle est cochee dans les reglages.
+  (Windows garde sa propre copie du fond d'ecran affiche, comme pour toute image
+  choisie a la main.)
+
+Registre (HKCU, le compte de l'utilisateur seulement)
+  - fond d'ecran : Control Panel\Desktop (WallpaperStyle, TileWallpaper) et le mode
+    "Image" de Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers, comme
+    Parametres -> Personnalisation ;
+  - demarrage avec Windows : valeur "ImmichWallpaperPortable" sous
+    Software\Microsoft\Windows\CurrentVersion\Run, seulement si l'option est cochee
+    dans le menu de l'icone (decochee par defaut). La decocher avant de supprimer
+    ou de deplacer le dossier.
+
+Reseau, en sortie uniquement (HTTPS, certificats verifies par Windows)
+  - le serveur Immich configure ; la cle API est chiffree pour ce compte Windows
+    (DPAPI) et n'est envoyee qu'a ce serveur ;
+  - api.github.com, une fois par jour, pour savoir si une nouvelle version existe
+    (decochable dans les reglages : l'application ne contacte alors plus GitHub).
+    Rien n'est telecharge ni remplace sans un clic sur "Installer la version ..."
+    dans le menu de l'icone, puis une confirmation. Le fichier telecharge est
+    verifie par son empreinte SHA-256 avant de remplacer ImmichWallpaper.exe.
+
+Port local
+  La page de reglages est servie sur 127.0.0.1 (jamais sur le reseau), protegee par
+  un jeton aleatoire, et seulement quand on l'ouvre : le port se referme apres
+  10 minutes sans utilisation. Aucun port n'est ouvert le reste du temps.
+
+
+Verifier l'executable
+---------------------
+
+Code source : https://github.com/spartan-dou/immich-wallpaper
+Les empreintes des fichiers publies sont dans SHA256SUMS.txt (page Releases), et chaque
+fichier a une attestation de provenance GitHub (compile par la CI du depot) :
+
+  gh attestation verify ImmichWallpaper.exe --repo spartan-dou/immich-wallpaper
