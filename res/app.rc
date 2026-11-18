@@ -1,0 +1,4 @@
+// Ressources de l'exe : icône et manifeste (DPI par écran, contrôles communs v6, droits de
+// l'utilisateur). Après modification, régénérer app-x64.o et app-arm64.o (voir README).
+1 ICON "icon.ico"
+1 24 "app.manifest"

@@ -19,9 +19,9 @@ Droits
 Programmes lances
   Aucun : ni PowerShell, ni cmd, ni script. L'ecran de verrouillage passe par l'API
   de Windows (WinRT LockScreen) dans le processus de l'application.
-  Seuls s'ouvrent, a la demande et par le shell de Windows : le navigateur (page de
-  reglages, photo dans Immich) et l'editeur de texte (journal). Apres une mise a jour
-  acceptee, l'application se relance elle-meme dans sa nouvelle version.
+  Seuls s'ouvrent, a la demande et par le shell de Windows : le navigateur (photo dans
+  Immich) et l'editeur de texte (journal). Apres une mise a jour acceptee,
+  l'application se relance elle-meme dans sa nouvelle version.
 
 Fichiers
   Uniquement dans ce dossier. Rien sur le bureau par defaut : l'icone "Voir cette
@@ -38,7 +38,7 @@ Registre (HKCU, le compte de l'utilisateur seulement)
     dans le menu de l'icone (decochee par defaut). La decocher avant de supprimer
     ou de deplacer le dossier.
 
-Reseau, en sortie uniquement (HTTPS, certificats verifies par Windows)
+Reseau, en sortie uniquement (HTTPS, certificats verifies par Windows, sans proxy)
   - le serveur Immich configure ; la cle API est chiffree pour ce compte Windows
     (DPAPI) et n'est envoyee qu'a ce serveur ;
   - api.github.com, une fois par jour, pour savoir si une nouvelle version existe
@@ -48,9 +48,8 @@ Reseau, en sortie uniquement (HTTPS, certificats verifies par Windows)
     verifie par son empreinte SHA-256 avant de remplacer ImmichWallpaper.exe.
 
 Port local
-  La page de reglages est servie sur 127.0.0.1 (jamais sur le reseau), protegee par
-  un jeton aleatoire, et seulement quand on l'ouvre : le port se referme apres
-  10 minutes sans utilisation. Aucun port n'est ouvert le reste du temps.
+  Aucun : les reglages s'affichent dans une fenetre de l'application. Rien n'ecoute
+  sur le reseau, pas meme sur 127.0.0.1.
 
 
 Verifier l'executable

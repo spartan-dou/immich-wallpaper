@@ -1,7 +1,7 @@
 name: build
 
 # Publication d'une release :
-#  - automatiquement quand la version de version.go n'a pas encore de release (push sur main) ;
+#  - automatiquement quand la version de Cargo.toml n'a pas encore de release (push sur main) ;
 #  - ou en poussant un tag vX.Y.Z.
 on:
   push:
@@ -15,7 +15,8 @@ permissions:
   contents: read
 
 # Les actions sont épinglées par SHA de commit (le tag est rappelé en commentaire) ;
-# Dependabot propose leurs mises à jour. La version de Go est celle de go.mod (toolchain).
+# Dependabot propose leurs mises à jour. La version de Rust est celle de rust-toolchain.toml
+# (installée par rustup, présent sur les machines de GitHub).
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,35 +25,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-
-      - name: Dépendances
+      - name: Format et tests (partie indépendante de Windows)
         run: |
-          go mod download
-          go mod verify
-
-      - name: Vérifications
-        run: |
-          test -z "$(gofmt -l .)"
-          go vet ./...
-          GOOS=windows GOARCH=amd64 go vet ./...
-          GOOS=windows GOARCH=arm64 go vet ./...
-          go test -race ./...
-
-      - name: Analyse statique et vulnérabilités connues
-        run: |
-          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
-          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
-          GOOS=windows staticcheck ./...
-          govulncheck ./...
-          GOOS=windows govulncheck ./...
-
-      - name: Fuzzing court des analyseurs binaires
-        run: |
-          go test -run '^$' -fuzz FuzzICC -fuzztime 30s .
-          go test -run '^$' -fuzz FuzzImageMeta -fuzztime 30s .
+          cargo fmt --check
+          cargo test --locked
 
   test-windows:
     runs-on: windows-latest
@@ -61,12 +37,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-
+      # Fenêtre de réglages comprise (créée, remplie, relue, enregistrée puis fermée).
       - name: Tests sous Windows
-        run: go test ./...
+        run: cargo test --locked
 
   build:
     needs: [test, test-windows]
@@ -74,14 +47,13 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       release: ${{ steps.version.outputs.release }}
+    env:
+      LLVM_MINGW: llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64
+      LLVM_MINGW_SHA256: 919380403de87dca3c581c2053230cd298af5e891286628ba0613b7fed370926
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
 
       - name: Version
         id: version
@@ -92,7 +64,7 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#v}"; RELEASE=true
           elif [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_NAME" = "main" ]; then
-            V=$(sed -n 's/^var appVersion = "\(.*\)"$/\1/p' version.go)
+            V=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
             if [ -n "$V" ] && ! gh release view "v$V" >/dev/null 2>&1; then
               VERSION="$V"; RELEASE=true
             fi
@@ -102,21 +74,29 @@ jobs:
           echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
           echo "Version : $VERSION (release : $RELEASE)"
 
+      - name: Éditeur de liens pour Windows (llvm-mingw, version et empreinte fixées)
+        run: |
+          curl -fsSL -o /tmp/llvm-mingw.tar.xz "https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/$LLVM_MINGW.tar.xz"
+          echo "$LLVM_MINGW_SHA256  /tmp/llvm-mingw.tar.xz" | sha256sum -c -
+          mkdir -p "$HOME/llvm-mingw" && tar xJf /tmp/llvm-mingw.tar.xz -C "$HOME/llvm-mingw" --strip-components=1
+          echo "$HOME/llvm-mingw/bin" >> "$GITHUB_PATH"
+
       - name: Build Windows x64 + ARM64 (classique, installeur, portable)
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          IW_VERSION: ${{ steps.version.outputs.version }}
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER: x86_64-w64-mingw32-clang
+          CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER: aarch64-w64-mingw32-clang
         run: |
           mkdir -p dist
           # Trois exécutables par architecture :
           #   ImmichWallpaper-<arch>.exe          exe classique (téléchargé par la mise à jour automatique)
           #   ImmichWallpaper-setup-<arch>.exe    installeur
           #   ImmichWallpaper-portable-<arch>.exe version portable (données à côté de l'exe)
-          for arch in amd64 arm64; do
-            name=$([ "$arch" = amd64 ] && echo x64 || echo arm64)
+          for arch in x86_64 aarch64; do
+            name=$([ "$arch" = x86_64 ] && echo x64 || echo arm64)
             for flavor in "" setup portable; do
-              GOOS=windows GOARCH=$arch CGO_ENABLED=0 go build -trimpath \
-                -ldflags "-H windowsgui -s -w -X main.appVersion=$VERSION -X main.flavor=$flavor" \
-                -o "dist/ImmichWallpaper-${flavor:+$flavor-}$name.exe" .
+              IW_FLAVOR=$flavor cargo build --locked --release --target "$arch-pc-windows-gnullvm"
+              cp "target/$arch-pc-windows-gnullvm/release/ImmichWallpaper.exe" "dist/ImmichWallpaper-${flavor:+$flavor-}$name.exe"
             done
           done
 
