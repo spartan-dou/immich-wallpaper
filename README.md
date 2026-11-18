@@ -66,19 +66,21 @@ La version portable est faite pour tourner sur un PC géré par un service infor
 
 ## Fenêtre de réglages
 
-Menu de l'icône → **Paramètres…** (elle s'ouvre aussi au premier lancement). Une fenêtre Windows à onglets, aux contrôles standard (thème, police et taille de texte de Windows, nette à toutes les échelles d'affichage) :
+Menu de l'icône → **Paramètres…** (elle s'ouvre aussi au premier lancement). Une fenêtre aux couleurs d'Immich, en thème clair ou sombre selon Windows (*Paramètres → Personnalisation → Couleurs*) : barre latérale, cartes arrondies, interrupteurs, et tes albums affichés avec leur photo de couverture, comme dans Immich.
 
-| Onglet | Contenu |
+| Page | Contenu |
 |---|---|
 | **Serveur** | URL, token (jamais réaffiché : laisser vide garde celui enregistré), certificat auto-signé, test de connexion |
-| **Albums** | albums du serveur à cocher, avec filtre et nombre d'éléments |
+| **Albums** | tes albums en grille avec leur couverture, à cocher ; recherche par nom |
 | **Affichage** | intervalle, ajustement, qualité, plusieurs écrans, cache hors ligne, paysage uniquement, photos masquées à réafficher |
 | **Planification** | plage horaire, pauses (batterie, connexion limitée, plein écran), préchargement |
 | **Saisons et heures** | règles d'albums par saison et/ou plage horaire |
 | **Légende** | lieu, date, position du texte, icône du bureau, écran de verrouillage |
 | **Mises à jour** | mises à jour automatiques, version |
 
-En haut, l'état de l'appli (« prochaine à 14:05 », « en pause »…). En bas : **Image suivante**, **Enregistrer** (touche Entrée) et **Fermer** (touche Échap), qui propose d'enregistrer s'il reste des modifications. Ctrl+Tab passe d'un onglet à l'autre. Une erreur (URL invalide, plage horaire incomplète…) est expliquée et rien n'est enregistré.
+En bas : **Image suivante**, **Fermer** (touche Échap), qui propose d'enregistrer s'il reste des modifications, et **Enregistrer** (touche Entrée). L'état de l'appli (« prochaine à 14:05 », « en pause »…) est rappelé en bas de la barre latérale. Tout se fait aussi au clavier : Tab, Espace pour cocher, flèches dans la grille d'albums, Ctrl+Tab pour changer de page. Une erreur (URL invalide, heure mal écrite…) est expliquée et rien n'est enregistré.
+
+Les vignettes de couverture sont téléchargées depuis ton serveur après le test de connexion (même token, même certificat épinglé), gardées en mémoire le temps de la session, jamais écrites sur le disque. La fenêtre est dessinée par l'appli elle-même (GDI+ de Windows), sans navigateur ni port ouvert, et reste nette à toutes les échelles d'affichage.
 
 ## Plusieurs écrans et mode hors ligne
 
@@ -184,12 +186,12 @@ cargo test                                                # partie indépendante
 cargo test --no-run --target x86_64-pc-windows-gnullvm    # puis lancer l'exe de test sous Windows
 ```
 
-Sous Windows, la suite comprend la fenêtre de réglages (créée, remplie depuis une configuration, relue à l'identique, listes d'albums, règles, enregistrement, erreurs, changement d'échelle d'affichage). Deux tests supplémentaires sont activés par des variables d'environnement :
+Sous Windows, la suite comprend la fenêtre de réglages (créée, remplie depuis une configuration, relue à l'identique, grilles d'albums et vignettes, règles, interrupteurs, enregistrement, erreurs, changement d'échelle d'affichage). Deux tests supplémentaires sont activés par des variables d'environnement :
 
 - `IW_APP_EXE=<chemin de ImmichWallpaper.exe>` : parcours complet de la vraie appli face à un faux serveur Immich (icône, menu, fenêtre de réglages, tirage, image suivante, photo précédente, changement d'écran, pause, favori, exclusion, préchargement).
 - `IW_NET_TESTS=1` : TLS et épinglage de certificat face à un vrai serveur, lecture de la dernière release.
 
-`IW_SETTINGS_SHOTS=<dossier>` enregistre une capture de chaque onglet de la fenêtre de réglages. Le parcours complet utilise le mode de vérification de l'appli, utilisable aussi à la main : `ImmichWallpaper.exe --selftest resultat.txt [--selftest-dir dossier]`. Dans ce mode, rien n'est appliqué au bureau : les images sont rendues dans le dossier de test, le fond d'écran, l'écran de verrouillage, le démarrage automatique et la configuration réelle ne sont pas touchés.
+`IW_SETTINGS_SHOTS=<dossier>` enregistre une capture de chaque page de la fenêtre de réglages, en thème clair et sombre. Le parcours complet utilise le mode de vérification de l'appli, utilisable aussi à la main : `ImmichWallpaper.exe --selftest resultat.txt [--selftest-dir dossier]`. Dans ce mode, rien n'est appliqué au bureau : les images sont rendues dans le dossier de test, le fond d'écran, l'écran de verrouillage, le démarrage automatique et la configuration réelle ne sont pas touchés.
 
 La pipeline exécute `cargo fmt --check` et les tests sous Linux et sous Windows, puis compile les exe avec llvm-mingw (version et empreinte fixées).
 
@@ -212,7 +214,7 @@ aarch64-w64-mingw32-windres app.rc -O coff -o app-arm64.o
 | `src/update.rs` | recherche et téléchargement d'une mise à jour |
 | `src/logfile.rs`, `src/util.rs` | journal avec rotation, erreurs, utilitaires |
 | `src/win/app.rs` | icône, menu, planification, événements système, mode de vérification |
-| `src/win/settings_window.rs` | fenêtre de réglages native |
+| `src/win/settings_window.rs` | fenêtre de réglages (dessin, thème, grille d'albums) |
 | `src/win/platform.rs` | fond d'écran, registre, DPAPI, écran de verrouillage (WinRT) |
 | `src/win/monitors.rs`, `src/win/context.rs` | une image par écran ; batterie, plein écran, connexion |
 | `src/win/install.rs`, `src/win/updater.rs` | installation, désinstallation, mise à jour |

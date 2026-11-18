@@ -65,6 +65,9 @@ pub struct AlbumInfo {
     pub updated_at: String,
     #[serde(rename = "lastModifiedAssetTimestamp", deserialize_with = "null_default")]
     pub last_modified_asset_timestamp: String,
+    /// Photo de couverture de l'album (vignette affichée dans la fenêtre de réglages).
+    #[serde(rename = "albumThumbnailAssetId", deserialize_with = "null_default")]
+    pub album_thumbnail_asset_id: String,
 }
 
 pub struct Client {

@@ -2,7 +2,7 @@
 //! configuration, test de connexion), indépendamment de l'interface. La fenêtre elle-même est
 //! dans `win/settings_window.rs` ; aucun port n'est ouvert, aucun navigateur n'est lancé.
 
-use crate::config::{normalize_fingerprint, read_config, read_config_or_default, same_server, save_config, AlbumRule, Config};
+use crate::config::{is_uuid, normalize_fingerprint, read_config, read_config_or_default, same_server, save_config, AlbumRule, Config};
 use crate::immich::{AlbumInfo, Client};
 use crate::util::{err, lock, Res};
 use std::collections::HashMap;
@@ -99,6 +99,51 @@ impl Settings {
         Ok(albums)
     }
 
+    /// Télécharge les vignettes de couverture demandées (identifiants de photos Immich) et les
+    /// remet à `found` au fur et à mesure, prêtes à afficher. Mêmes garde-fous que le test de
+    /// connexion : le token enregistré ne part que vers son serveur, et un certificat auto-signé
+    /// doit être celui relevé au test. Les vignettes déjà chargées viennent du cache.
+    pub fn album_covers(&self, input: Config, ids: &[String], mut found: impl FnMut(&str, Arc<Cover>)) -> Res<()> {
+        let mut input = self.merge_key(input)?;
+        input.albums = vec!["00000000-0000-0000-0000-000000000000".into()];
+        input.album_rules.clear();
+        input.active_from.clear();
+        input.active_to.clear();
+        input.cert_fingerprint.clear();
+        input.normalize()?;
+        if input.insecure_skip_verify {
+            match lock(&self.seen_pins).get(&input.server_url) {
+                Some(fp) => input.cert_fingerprint = fp.clone(),
+                None => return err("certificat auto-signé : teste d'abord la connexion"),
+            }
+        }
+        let client = Client::new(&input);
+        for id in ids {
+            if !is_uuid(id) {
+                continue;
+            }
+            let key = format!("{}/{id}", input.server_url);
+            if let Some(c) = lock(&COVERS).get(&key).cloned() {
+                found(id, c);
+                continue;
+            }
+            match client.download(id, "thumbnail").and_then(|b| cover_from_image(&b)) {
+                Ok(c) => {
+                    let c = Arc::new(c);
+                    let mut cache = lock(&COVERS);
+                    if cache.len() >= MAX_COVERS {
+                        cache.clear();
+                    }
+                    cache.insert(key, c.clone());
+                    drop(cache);
+                    found(id, c);
+                }
+                Err(e) => crate::logf!("vignette d'album {id} : {e}"),
+            }
+        }
+        Ok(())
+    }
+
     /// Valide et enregistre la configuration saisie, puis prévient l'appli.
     pub fn save(&self, input: Config) -> Res<Config> {
         let mut check = self.merge_key(input)?;
@@ -141,6 +186,48 @@ impl Settings {
         input.api_key = old.api_key;
         Ok(input)
     }
+}
+
+// ---------- vignettes de couverture ----------
+
+/// Vignette carrée prête à afficher : pixels BGRA (opaques), ligne par ligne.
+#[derive(Debug, PartialEq)]
+pub struct Cover {
+    pub side: u32,
+    pub bgra: Vec<u8>,
+}
+
+/// Côté maximal des vignettes gardées (de quoi rester nettes sur un écran à 200 %).
+pub const COVER_SIDE: u32 = 320;
+const MAX_COVERS: usize = 400;
+
+/// Vignettes déjà téléchargées pendant cette session, par serveur et photo.
+static COVERS: std::sync::LazyLock<Mutex<HashMap<String, Arc<Cover>>>> = std::sync::LazyLock::new(Default::default);
+
+/// Vignette déjà téléchargée pour ce serveur (adresse normalisée) et cette photo.
+pub fn cached_cover(server_url: &str, id: &str) -> Option<Arc<Cover>> {
+    lock(&COVERS).get(&format!("{server_url}/{id}")).cloned()
+}
+
+/// Ajoute une vignette au cache (captures d'écran des tests).
+#[cfg(test)]
+pub fn put_cover(server_url: &str, id: &str, c: Cover) {
+    lock(&COVERS).insert(format!("{server_url}/{id}"), Arc::new(c));
+}
+
+/// Décode une vignette (convertie en sRGB, redressée), la recadre au carré central et la réduit.
+pub fn cover_from_image(data: &[u8]) -> Res<Cover> {
+    let img = crate::colorprofile::safe_decode(data)?;
+    let (w, h) = img.dimensions();
+    let s = w.min(h).max(1);
+    let side = s.min(COVER_SIDE);
+    let crop = (((w - s) / 2) as f64, ((h - s) / 2) as f64, s as f64, s as f64);
+    let sq = crate::render::resize(&img, Some(crop), side, side, fast_image_resize::FilterType::CatmullRom);
+    let mut bgra = Vec::with_capacity((side * side * 4) as usize);
+    for p in sq.pixels() {
+        bgra.extend_from_slice(&[p[2], p[1], p[0], 255]);
+    }
+    Ok(Cover { side, bgra })
 }
 
 // ---------- aides de présentation (indépendantes de l'interface) ----------
@@ -250,13 +337,15 @@ pub fn sort_albums(albums: &mut [AlbumInfo]) {
     });
 }
 
-/// Ligne d'une liste d'albums à cocher.
+/// Album proposé à la sélection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlbumRow {
     pub id: String,
     pub name: String,
     /// Nombre d'éléments, si l'album figure dans la liste chargée depuis Immich.
     pub count: Option<i64>,
+    /// Photo de couverture ("" : aucune).
+    pub thumb: String,
 }
 
 /// Albums chargés depuis Immich, suivis des albums cochés qui n'y figurent pas (pas encore
@@ -268,6 +357,7 @@ pub fn album_rows(albums: &[AlbumInfo], checked: &[String]) -> Vec<AlbumRow> {
             id: a.id.clone(),
             name: a.album_name.clone(),
             count: Some(a.asset_count),
+            thumb: a.album_thumbnail_asset_id.clone(),
         })
         .collect();
     for id in checked {
@@ -277,6 +367,7 @@ pub fn album_rows(albums: &[AlbumInfo], checked: &[String]) -> Vec<AlbumRow> {
                 id: id.clone(),
                 name: format!("(album {short}…)"),
                 count: None,
+                thumb: String::new(),
             });
         }
     }
@@ -298,10 +389,14 @@ pub fn toggle_id(ids: &mut Vec<String>, id: &str, on: bool) {
     }
 }
 
-/// Résumé d'une règle d'albums pour la liste des règles.
-pub fn rule_label(r: &AlbumRule) -> String {
+/// Titre d'une règle d'albums : sa saison.
+pub fn rule_title(r: &AlbumRule) -> &'static str {
     let season = SEASONS[choice_index(SEASONS, &r.season)].1;
-    let season = season.split(" (").next().unwrap_or(season);
+    season.split(" (").next().unwrap_or(season)
+}
+
+/// Détail d'une règle d'albums : heures et nombre d'albums.
+pub fn rule_detail(r: &AlbumRule) -> String {
     let dash = |s: &str| if s.is_empty() { "--:--".to_string() } else { s.to_string() };
     let hours = if r.from.is_empty() && r.to.is_empty() {
         "toute la journée".to_string()
@@ -313,7 +408,23 @@ pub fn rule_label(r: &AlbumRule) -> String {
         1 => "1 album".to_string(),
         n => format!("{n} albums"),
     };
-    format!("{season} · {hours} · {n}")
+    format!("{hours} · {n}")
+}
+
+/// Résumé d'une règle d'albums.
+#[cfg(test)]
+pub fn rule_label(r: &AlbumRule) -> String {
+    format!("{} · {}", rule_title(r), rule_detail(r))
+}
+
+/// « 12 éléments ».
+pub fn items_label(n: Option<i64>) -> String {
+    match n {
+        None => "album introuvable".into(),
+        Some(0) => "vide".into(),
+        Some(1) => "1 élément".into(),
+        Some(n) => format!("{n} éléments"),
+    }
 }
 
 /// « 3 albums sélectionnés ».
@@ -329,7 +440,7 @@ pub fn count_label(n: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::write_default_config;
-    use crate::testutil::{temp_dir, FakeImmich, ALB1, ALB2, KEY};
+    use crate::testutil::{temp_dir, FakeImmich, ALB1, ALB2, KEY, L1, L2};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]
@@ -426,6 +537,35 @@ mod tests {
         assert!(s.save(input(&other_url, "", &[ALB1])).is_err());
         assert!(!leaked.load(Ordering::SeqCst), "token réutilisé pour un autre serveur");
 
+        // Vignettes de couverture : téléchargées une fois, recadrées au carré, puis servies par le cache.
+        let ids: Vec<String> = albums.iter().map(|a| a.album_thumbnail_asset_id.clone()).collect();
+        assert!(ids.contains(&L1.to_string()) && ids.contains(&L2.to_string()), "{ids:?}");
+        let mut got = vec![];
+        s.album_covers(input(&fake.url, "", &[]), &ids, |id, c| got.push((id.to_string(), c)))
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(
+            got.iter().all(|(_, c)| c.side == 40 && c.bgra.len() == 40 * 40 * 4),
+            "image 80x40 → carré 40x40"
+        );
+        let before = fake.count("/api/assets", "/thumbnail");
+        s.album_covers(input(&fake.url, "", &[]), &ids, |_, _| {}).unwrap();
+        assert_eq!(
+            fake.count("/api/assets", "/thumbnail"),
+            before,
+            "vignettes retéléchargées malgré le cache"
+        );
+        // Identifiant invalide ignoré ; jamais de token vers un autre serveur.
+        s.album_covers(input(&fake.url, "", &[]), &["../config".to_string()], |_, _| {
+            panic!("identifiant invalide accepté")
+        })
+        .unwrap();
+        assert!(s.album_covers(input(&other_url, "", &[]), &ids, |_, _| {}).is_err());
+        // Certificat auto-signé : la vignette n'est demandée qu'après un test (empreinte relevée).
+        let mut insecure = input("https://autre.exemple.fr", KEY, &[]);
+        insecure.insecure_skip_verify = true;
+        assert!(s.album_covers(insecure, &ids, |_, _| {}).is_err());
+
         // Fichier illisible : valeurs par défaut et erreur signalée.
         std::fs::write(&cfg_path, "{ pas du json").unwrap();
         let ui = s.load();
@@ -519,7 +659,8 @@ mod tests {
             AlbumRow {
                 id: "99999999-aaaa".into(),
                 name: "(album 99999999…)".into(),
-                count: None
+                count: None,
+                thumb: String::new(),
             }
         );
         assert_eq!(rows[1].count, Some(3));
@@ -546,5 +687,10 @@ mod tests {
             to: "".into(),
         };
         assert_eq!(rule_label(&r), "Été · 08:00 → --:-- · 2 albums");
+        assert_eq!((rule_title(&r), rule_detail(&r).as_str()), ("Été", "08:00 → --:-- · 2 albums"));
+        // Vignette : carré central, réduite au plus à COVER_SIDE.
+        let c = cover_from_image(&crate::testutil::mk_img(900, 500, "png")).unwrap();
+        assert_eq!((c.side, c.bgra.len()), (COVER_SIDE, (COVER_SIDE * COVER_SIDE * 4) as usize));
+        assert!(cover_from_image(b"pas une image").is_err());
     }
 }

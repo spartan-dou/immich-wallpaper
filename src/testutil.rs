@@ -95,11 +95,13 @@ impl FakeImmich {
                     status(401)
                 } else if path == "/api/albums" && query.contains("shared=true") {
                     json(serde_json::json!([
-                        {"id": ALB1, "albumName": "Finlande", "assetCount": 3, "updatedAt": "2026-01-01T00:00:00Z"},
-                        {"id": ALB2, "albumName": "Bassin", "assetCount": st.count2.load(Ordering::SeqCst), "updatedAt": "2026-01-01T00:00:00Z", "lastModifiedAssetTimestamp": null},
+                        {"id": ALB1, "albumName": "Finlande", "assetCount": 3, "updatedAt": "2026-01-01T00:00:00Z", "albumThumbnailAssetId": L1},
+                        {"id": ALB2, "albumName": "Bassin", "assetCount": st.count2.load(Ordering::SeqCst), "updatedAt": "2026-01-01T00:00:00Z", "lastModifiedAssetTimestamp": null, "albumThumbnailAssetId": L2},
                     ]))
                 } else if path == "/api/albums" {
-                    json(serde_json::json!([{"id": ALB1, "albumName": "Finlande", "assetCount": 3, "updatedAt": "2026-01-01T00:00:00Z"}]))
+                    json(
+                        serde_json::json!([{"id": ALB1, "albumName": "Finlande", "assetCount": 3, "updatedAt": "2026-01-01T00:00:00Z", "albumThumbnailAssetId": L1}]),
+                    )
                 } else if path == format!("/api/albums/{ALB1}") {
                     json(serde_json::json!({"albumName": "Finlande", "assetCount": 3, "assets": [
                         {"id": P1, "type": "IMAGE", "originalFileName": "portrait.jpg"},

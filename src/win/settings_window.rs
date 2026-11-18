@@ -1,12 +1,18 @@
-//! Fenêtre de réglages native : contrôles standard de Windows dans une fenêtre à onglets.
+//! Fenêtre de réglages, dans le style d'Immich : barre latérale, cartes arrondies, interrupteurs,
+//! boutons en pastille, grille d'albums avec leurs vignettes de couverture, thème clair ou sombre
+//! selon Windows.
 //!
-//! Elle vit sur le thread de l'interface (celui de l'icône de la barre système) : la boucle de
-//! messages de l'appli lui passe d'abord chaque message (`pre_translate`) pour la navigation au
-//! clavier des boîtes de dialogue. Le test de connexion et « Image suivante » tournent dans des
-//! threads ; leur résultat revient par un message posté à la fenêtre. Aucun port n'est ouvert,
-//! aucun navigateur n'est lancé.
+//! Tout est dessiné par l'appli (GDI+ pour les formes antialiasées, GDI pour le texte ClearType),
+//! sans bibliothèque d'interface. Les seuls contrôles Windows sont les zones de saisie (EDIT) et
+//! des boutons « owner-draw », qui gardent le clavier, le focus et l'accessibilité de Windows.
+//!
+//! La fenêtre vit sur le thread de l'interface (celui de l'icône de la barre système) : la boucle
+//! de messages de l'appli lui passe d'abord chaque message (`pre_translate`) pour la navigation au
+//! clavier. Le test de connexion, les vignettes et « Image suivante » tournent dans des threads ;
+//! leur résultat revient par un message posté à la fenêtre. Aucun port n'est ouvert, aucun
+//! navigateur n'est lancé.
 
-use crate::config::{parse_clock, AlbumRule, Config};
+use crate::config::{normalize_server_url, AlbumRule, Config};
 use crate::immich::AlbumInfo;
 use crate::logf;
 use crate::settings::*;
@@ -16,179 +22,864 @@ use crate::{is_portable, VERSION};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once};
-use windows::core::{w, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SYSTEMTIME, WPARAM};
+use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
+use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DeleteObject, DrawTextW, GetDC, GetMonitorInfoW, GetSysColor, GetSysColorBrush, InvalidateRect, MonitorFromWindow,
-    ReleaseDC, SelectObject, SetBkColor, SetTextColor, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_WINDOW, DT_CALCRECT, DT_EDITCONTROL,
-    DT_NOPREFIX, DT_WORDBREAK, FONT_CHARSET, FONT_QUALITY, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    SYS_COLOR_INDEX,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW, CreateSolidBrush, DeleteDC, DeleteObject,
+    DrawTextW, EndPaint, EnumFontFamiliesExW, FillRect, GetDC, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, RedrawWindow, ReleaseDC,
+    ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor, DRAW_TEXT_FORMAT, DT_CALCRECT, DT_EDITCONTROL, DT_END_ELLIPSIS,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FONT_CHARSET, FONT_QUALITY, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, SRCCOPY, TEXTMETRICW,
+    TRANSPARENT,
+};
+use windows::Win32::Graphics::GdiPlus::{
+    FillModeAlternate, GdipAddPathArc, GdipAddPathLine, GdipClosePathFigure, GdipCreateBitmapFromScan0, GdipCreateFromHDC, GdipCreatePath,
+    GdipCreatePen1, GdipCreateSolidFill, GdipCreateTexture, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen,
+    GdipDisposeImage, GdipDrawArc, GdipDrawEllipse, GdipDrawLines, GdipDrawPath, GdipFillEllipse, GdipFillPath, GdipScaleTextureTransform,
+    GdipSetInterpolationMode, GdipSetPenEndCap, GdipSetPenLineJoin, GdipSetPenStartCap, GdipSetPixelOffsetMode, GdipSetSmoothingMode,
+    GdipTranslateTextureTransform, GdiplusStartup, GdiplusStartupInput, GpBrush, GpGraphics, GpImage, GpPath, GpPen,
+    InterpolationModeHighQualityBicubic, LineCapRound, LineJoinRound, MatrixOrderAppend, PixelOffsetModeHalf, PointF,
+    SmoothingModeAntiAlias, Status, UnitPixel, WrapModeTileFlipXY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, SetWindowTheme, EMF_CENTERED, ICC_DATE_CLASSES, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
-    ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS, LVCFMT_RIGHT, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
-    LVIF_STATE, LVIF_TEXT, LVIS_STATEIMAGEMASK, LVITEMW, NMHDR, NMLISTVIEW, NMLVEMPTYMARKUP, TCIF_TEXT, TCITEMW,
+    InitCommonControlsEx, SetScrollInfo, SetWindowTheme, DRAWITEMSTRUCT, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
 };
-use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi};
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, GetKeyState, SetFocus};
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, GetFocus, GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW,
-    IsChild, IsDialogMessageW, IsIconic, KillTimer, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassExW, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, CW_USEDEFAULT, HICON, HMENU, IDC_ARROW, IDNO, IDYES,
-    MB_ICONQUESTION, MB_ICONWARNING, MB_YESNOCANCEL, MESSAGEBOX_STYLE, MINMAXINFO, MSG, NONCLIENTMETRICSW, SM_CXICON, SM_CXSMICON,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DrawIconEx, GetClientRect,
+    GetScrollInfo, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsChild, IsDialogMessageW, IsIconic,
+    IsWindowVisible, KillTimer, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu, CW_USEDEFAULT, DI_NORMAL, HICON, HMENU, IDC_ARROW, IDNO, IDYES,
+    MB_ICONQUESTION, MB_ICONWARNING, MB_YESNOCANCEL, MESSAGEBOX_STYLE, MF_CHECKED, MF_STRING, MINMAXINFO, MSG, SB_VERT, SCROLLINFO,
+    SIF_ALL, SIF_PAGE, SIF_POS, SIF_RANGE, SM_CXICON, SM_CXSMICON, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_RESTORE, SW_SHOW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW,
 };
 
-// ---------- valeurs Win32 (winuser.h, commctrl.h) ----------
+// ---------- valeurs Win32 (winuser.h) ----------
 
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
 const WS_CHILD: u32 = 0x4000_0000;
 const WS_VISIBLE: u32 = 0x1000_0000;
 const WS_CLIPCHILDREN: u32 = 0x0200_0000;
-const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
 const WS_TABSTOP: u32 = 0x0001_0000;
 const WS_VSCROLL: u32 = 0x0020_0000;
-const WS_EX_CLIENTEDGE: u32 = 0x0200;
 const WS_EX_CONTROLPARENT: u32 = 0x0001_0000;
-
-const SS_LEFT: u32 = 0x0000;
-const SS_LEFTNOWORDWRAP: u32 = 0x000C;
-const SS_NOPREFIX: u32 = 0x0080;
-const SS_CENTERIMAGE: u32 = 0x0200;
-const SS_ENDELLIPSIS: u32 = 0x4000;
-const BS_PUSHBUTTON: u32 = 0x0000;
-const BS_DEFPUSHBUTTON: u32 = 0x0001;
-const BS_AUTOCHECKBOX: u32 = 0x0003;
-const BS_MULTILINE: u32 = 0x2000;
+const BS_OWNERDRAW: u32 = 0x000B;
+const BS_NOTIFY: u32 = 0x4000;
 const ES_PASSWORD: u32 = 0x0020;
 const ES_AUTOHSCROLL: u32 = 0x0080;
 const ES_NUMBER: u32 = 0x2000;
-const CBS_DROPDOWNLIST: u32 = 0x0003;
-const LBS_NOTIFY: u32 = 0x0001;
-const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
-const LVS_REPORT: u32 = 0x0001;
-const LVS_SINGLESEL: u32 = 0x0004;
-const LVS_SHOWSELALWAYS: u32 = 0x0008;
-const LVS_NOCOLUMNHEADER: u32 = 0x4000;
-const LVS_NOSORTHEADER: u32 = 0x8000;
-const LVS_EX_CHECKBOXES: isize = 0x0004;
-const LVS_EX_FULLROWSELECT: isize = 0x0020;
-const LVS_EX_DOUBLEBUFFER: isize = 0x0001_0000;
-const UDS_SETBUDDYINT: u32 = 0x0002;
-const UDS_ALIGNRIGHT: u32 = 0x0004;
-const UDS_ARROWKEYS: u32 = 0x0020;
-const UDS_NOTHOUSANDS: u32 = 0x0080;
-const UDS_HOTTRACK: u32 = 0x0100;
-const DTS_SHOWNONE: u32 = 0x0002;
-const DTS_TIMEFORMAT: u32 = 0x0009;
 
+const WM_SETFOCUS: u32 = 0x0007;
+const WM_KILLFOCUS: u32 = 0x0008;
 const WM_DESTROY: u32 = 0x0002;
 const WM_SIZE: u32 = 0x0005;
 const WM_ACTIVATE: u32 = 0x0006;
-const WM_SETREDRAW: u32 = 0x000B;
+const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
+const WM_ERASEBKGND: u32 = 0x0014;
+const WM_SETTINGCHANGE: u32 = 0x001A;
 const WM_GETMINMAXINFO: u32 = 0x0024;
+const WM_DRAWITEM: u32 = 0x002B;
 const WM_SETFONT: u32 = 0x0030;
-const WM_NOTIFY: u32 = 0x004E;
 const WM_SETICON: u32 = 0x0080;
 const WM_NCDESTROY: u32 = 0x0082;
+const WM_GETDLGCODE: u32 = 0x0087;
 const WM_KEYDOWN: u32 = 0x0100;
+const WM_CHAR: u32 = 0x0102;
 const WM_COMMAND: u32 = 0x0111;
 const WM_TIMER: u32 = 0x0113;
-const WM_CTLCOLORBTN: u32 = 0x0135;
-const WM_CTLCOLORDLG: u32 = 0x0136;
-const WM_CTLCOLORSTATIC: u32 = 0x0138;
+const WM_VSCROLL: u32 = 0x0115;
+const WM_CTLCOLOREDIT: u32 = 0x0133;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_DPICHANGED: u32 = 0x02E0;
 const WM_APP_DONE: u32 = 0x8000 + 20;
 const DM_GETDEFID: u32 = 0x0400;
 const DC_HASDEFID: isize = 0x534B;
-
-const BM_GETCHECK: u32 = 0x00F0;
-const BM_SETCHECK: u32 = 0x00F1;
+const BM_SETSTYLE: u32 = 0x00F4;
 const BN_CLICKED: u32 = 0;
+const BN_DOUBLECLICKED: u32 = 5;
+const BN_SETFOCUS: u32 = 6;
+const EN_SETFOCUS: u32 = 0x0100;
+const EN_KILLFOCUS: u32 = 0x0200;
 const EN_CHANGE: u32 = 0x0300;
 const EM_SETCUEBANNER: u32 = 0x1501;
-const CB_ADDSTRING: u32 = 0x0143;
-const CB_GETCURSEL: u32 = 0x0147;
-const CB_SETCURSEL: u32 = 0x014E;
-const CBN_SELCHANGE: u32 = 1;
-const LB_ADDSTRING: u32 = 0x0180;
-const LB_INSERTSTRING: u32 = 0x0181;
-const LB_DELETESTRING: u32 = 0x0182;
-const LB_RESETCONTENT: u32 = 0x0184;
-const LB_SETCURSEL: u32 = 0x0186;
-const LB_GETCURSEL: u32 = 0x0188;
-const LBN_SELCHANGE: u32 = 1;
-const LVM_DELETEALLITEMS: u32 = 0x1009;
-const LVM_SETCOLUMNWIDTH: u32 = 0x101E;
-const LVM_SETITEMSTATE: u32 = 0x102B;
-const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = 0x1036;
-const LVM_INSERTITEMW: u32 = 0x104D;
-const LVM_INSERTCOLUMNW: u32 = 0x1061;
-const LVM_SETITEMTEXTW: u32 = 0x1074;
-const TCM_GETCURSEL: u32 = 0x130B;
-const TCM_SETCURSEL: u32 = 0x130C;
-const TCM_ADJUSTRECT: u32 = 0x1328;
-const TCM_INSERTITEMW: u32 = 0x133E;
-const UDM_SETBUDDY: u32 = 0x0469;
-const UDM_SETRANGE32: u32 = 0x046F;
-const UDM_SETPOS32: u32 = 0x0471;
-const DTM_GETSYSTEMTIME: u32 = 0x1001;
-const DTM_SETSYSTEMTIME: u32 = 0x1002;
-const DTM_SETFORMATW: u32 = 0x1032;
-const GDT_VALID: isize = 0;
-const GDT_NONE: usize = 1;
-
-// Codes de notification (négatifs dans commctrl.h).
-const LVN_ITEMCHANGED: u32 = 0xFFFF_FF9B; // LVN_FIRST - 1
-const LVN_GETEMPTYMARKUP: u32 = 0xFFFF_FF45; // LVN_FIRST - 87
-const TCN_SELCHANGE: u32 = 0xFFFF_FDD9; // TCN_FIRST - 1
-const DTN_DATETIMECHANGE: u32 = 0xFFFF_FD09; // DTN_FIRST2 - 6
+const DLGC_WANTARROWS: isize = 0x0001;
+const DLGC_UNDEFPUSHBUTTON: isize = 0x0020;
+const DLGC_WANTCHARS: isize = 0x0080;
+const DLGC_BUTTON: isize = 0x2000;
+const ODS_SELECTED: u32 = 0x0001;
+const ODS_DISABLED: u32 = 0x0004;
+const ODS_FOCUS: u32 = 0x0010;
+const ODS_NOFOCUSRECT: u32 = 0x0200;
 
 const VK_TAB: usize = 0x09;
 const VK_SHIFT: i32 = 0x10;
 const VK_CONTROL: i32 = 0x11;
+const VK_PRIOR: usize = 0x21;
+const VK_NEXT: usize = 0x22;
+const VK_END: usize = 0x23;
+const VK_HOME: usize = 0x24;
+const VK_LEFT: usize = 0x25;
+const VK_UP: usize = 0x26;
+const VK_RIGHT: usize = 0x27;
+const VK_DOWN: usize = 0x28;
 
 const ID_SAVE: usize = 1; // IDOK : touche Entrée
 const ID_CLOSE: usize = 2; // IDCANCEL : touche Échap
 const TIMER_STATUS: usize = 1;
 
 const CLASS_MAIN: PCWSTR = w!("ImmichWallpaperSettings");
-const CLASS_PAGE: PCWSTR = w!("ImmichWallpaperSettingsPage");
+const CLASS_CONTENT: PCWSTR = w!("ImmichWallpaperSettingsContent");
+const CLASS_GRID: PCWSTR = w!("ImmichWallpaperAlbumGrid");
 
 // ---------- mise en page, en pixels à 100 % (96 ppp), mise à l'échelle de l'écran ----------
 
-const DLG_W: i32 = 700; // zone cliente à l'ouverture
-const DLG_H: i32 = 580;
-const MIN_W: i32 = 600;
-const MIN_H: i32 = 500;
-const MARGIN: i32 = 12;
-const PAGE_PAD: i32 = 16;
-const LABEL_W: i32 = 176;
-const ROW_H: i32 = 23;
-const BTN_H: i32 = 26;
-const CHECK_H: i32 = 19;
-const CHECK_GLYPH: i32 = 20; // case à cocher et espace avant son texte
-const CLOCK_W: i32 = 100;
+const DLG_W: i32 = 1000; // zone cliente à l'ouverture
+const DLG_H: i32 = 700;
+const MIN_W: i32 = 880;
+const MIN_H: i32 = 560;
+const SIDEBAR_W: i32 = 236;
+const FOOTER_H: i32 = 68;
+const PAD: i32 = 32; // marge du contenu
+const FORM_W: i32 = 720; // largeur maximale des cartes de formulaire
+const FIELD_H: i32 = 40;
+const BTN_H: i32 = 38;
+const RULES_W: i32 = 256;
 
 const PAGE_SERVER: usize = 0;
 const PAGE_ALBUMS: usize = 1;
-const PAGE_NAMES: [&str; 7] = [
-    "Serveur",
-    "Albums",
-    "Affichage",
-    "Planification",
-    "Saisons et heures",
-    "Légende",
-    "Mises à jour",
+const PAGE_DISPLAY: usize = 2;
+const PAGE_SCHEDULE: usize = 3;
+const PAGE_RULES: usize = 4;
+const PAGE_CAPTION: usize = 5;
+const PAGE_UPDATES: usize = 6;
+const PAGES: [(&str, Icon); 7] = [
+    ("Serveur", Icon::Server),
+    ("Albums", Icon::Albums),
+    ("Affichage", Icon::Display),
+    ("Planification", Icon::Clock),
+    ("Saisons et heures", Icon::Calendar),
+    ("Légende", Icon::Pin),
+    ("Mises à jour", Icon::Update),
 ];
 
-/// Couleurs de texte (COLORREF : 0x00BBGGRR) ; 0 = couleur normale.
-const COLOR_OK: u32 = 0x003A_7A1F;
-const COLOR_ERR: u32 = 0x0018_23B4;
+const GRID_ALBUMS: usize = 0;
+const GRID_RULE: usize = 1;
+
+// ---------- textes ----------
+
+const KEY_HINT: &str = "Immich → Paramètres du compte → Clés API. Permissions : album.read, asset.read, asset.view, \
+                        asset.download (et asset.update pour « Ajouter aux favoris »).";
+const HTTP_WARN: &str = "Connexion non chiffrée vers un serveur hors réseau local : le token et les photos circulent en clair. \
+                         Préfère https://.";
+const PIN_HINT: &str = "Le certificat présenté lors du test est mémorisé (empreinte SHA-256) : seul celui-ci sera accepté \
+                        ensuite. S'il est renouvelé, reteste la connexion puis enregistre.";
+const OFFLINE_HINT: &str = "Si Immich est injoignable (déplacement, VPN coupé…), la rotation continue avec les dernières \
+                            photos téléchargées. 0 = désactivé.";
+const HOURS_HINT: &str = "Laisse vide pour changer toute la journée. Une plage comme 22:00 → 07:00 passe par minuit.";
+const PAUSES_HINT: &str = "Ne concerne que les changements automatiques : « Image suivante » fonctionne toujours. Le \
+                           changement en attente se fait dès que la condition disparaît.";
+const PRELOAD_HINT: &str = "Le changement suivant est alors immédiat et ne dépend plus du réseau, en particulier au \
+                            déverrouillage du PC.";
+const RULES_HINT: &str = "Quand une règle s'applique, ses albums remplacent les albums habituels ; plusieurs règles en même \
+                          temps : leurs albums sont réunis.";
+const LINK_HINT: &str = "Le fond d'écran n'est pas cliquable sous Windows : cette icône, ou un clic gauche sur l'icône près \
+                         de l'horloge, ouvre la photo affichée.";
+const LOCK_HINT: &str = "Dans Windows : Paramètres → Personnalisation → Écran de verrouillage → « Image » (et non « Windows \
+                         à la une »).";
+const UPDATE_HINT: &str = "Vérification au démarrage puis une fois par jour, depuis les releases GitHub du projet \
+                           uniquement ; l'empreinte SHA-256 détecte un fichier corrompu (les releases ne sont pas signées).";
+const UPDATE_PORTABLE_HINT: &str = "Version portable : une nouvelle version est seulement annoncée dans le menu de l'icône \
+                                    (« Installer la version… ») ; rien n'est téléchargé ni remplacé sans ton accord. \
+                                    Décoché, l'appli ne contacte plus GitHub d'elle-même.";
+
+// ---------- thème (couleurs d'Immich) ----------
+
+/// Couleurs en 0xRRGGBB.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Theme {
+    dark: bool,
+    bg: u32,
+    card: u32,
+    field: u32,
+    border: u32,
+    fg: u32,
+    muted: u32,
+    primary: u32,
+    on_primary: u32,
+    soft: u32, // fond de l'élément sélectionné (barre latérale, règles)
+    secondary: u32,
+    track: u32, // interrupteur éteint
+    divider: u32,
+    ok: u32,
+    err: u32,
+}
+
+const LIGHT: Theme = Theme {
+    dark: false,
+    bg: 0xFFFFFF,
+    card: 0xF6F6F4,
+    field: 0xFFFFFF,
+    border: 0xDCDCD7,
+    fg: 0x18181B,
+    muted: 0x6B6B73,
+    primary: 0x4250AF,
+    on_primary: 0xFFFFFF,
+    soft: 0xE7E9F6,
+    secondary: 0xEEEEF2,
+    track: 0xC7C8CE,
+    divider: 0xE4E4E0,
+    ok: 0x15803D,
+    err: 0xC0262D,
+};
+
+const DARK: Theme = Theme {
+    dark: true,
+    bg: 0x000000,
+    card: 0x212121,
+    field: 0x2A2A2A,
+    border: 0x3A3A3A,
+    fg: 0xE5E7EB,
+    muted: 0x9CA3AF,
+    primary: 0xADCBFA,
+    on_primary: 0x000000,
+    soft: 0x232A35,
+    secondary: 0x262626,
+    track: 0x4B4B52,
+    divider: 0x2E2E2E,
+    ok: 0x4ADE80,
+    err: 0xF87171,
+};
+
+/// Thème imposé (tests) : 0 = celui de Windows, 1 = clair, 2 = sombre.
+static THEME_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Windows est en mode sombre pour les applications.
+fn system_dark() -> bool {
+    match THEME_OVERRIDE.load(Ordering::SeqCst) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    windows_registry::CURRENT_USER
+        .open(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|k| k.get_u32("AppsUseLightTheme"))
+        .map(|v| v == 0)
+        .unwrap_or(false)
+}
+
+fn colorref(rgb: u32) -> COLORREF {
+    COLORREF(((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF))
+}
+
+fn argb(rgb: u32) -> u32 {
+    0xFF00_0000 | rgb
+}
+
+/// Mélange de deux couleurs (t = part de b).
+fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |s: u32| {
+        let (x, y) = (((a >> s) & 0xFF) as f32, ((b >> s) & 0xFF) as f32);
+        ((x + (y - x) * t).round().clamp(0.0, 255.0) as u32) << s
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+enum Tone {
+    #[default]
+    Fg,
+    Muted,
+    Ok,
+    Err,
+}
+
+impl Theme {
+    fn tone(&self, t: Tone) -> u32 {
+        match t {
+            Tone::Fg => self.fg,
+            Tone::Muted => self.muted,
+            Tone::Ok => self.ok,
+            Tone::Err => self.err,
+        }
+    }
+    fn hover(&self, base: u32) -> u32 {
+        mix(base, self.fg, if self.dark { 0.10 } else { 0.05 })
+    }
+}
+
+// ---------- dessin : GDI+ pour les formes, GDI pour le texte ----------
+
+fn gdiplus() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        let mut token = 0usize;
+        let input = GdiplusStartupInput {
+            GdiplusVersion: 1,
+            ..Default::default()
+        };
+        let _ = GdiplusStartup(&mut token, &input, std::ptr::null_mut());
+    });
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Rf {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+fn rf(r: RECT) -> Rf {
+    Rf {
+        x: r.left as f32,
+        y: r.top as f32,
+        w: (r.right - r.left) as f32,
+        h: (r.bottom - r.top) as f32,
+    }
+}
+
+fn rect(x: i32, y: i32, w: i32, h: i32) -> RECT {
+    RECT {
+        left: x,
+        top: y,
+        right: x + w.max(0),
+        bottom: y + h.max(0),
+    }
+}
+
+fn inset(r: RECT, d: i32) -> RECT {
+    RECT {
+        left: r.left + d,
+        top: r.top + d,
+        right: r.right - d,
+        bottom: r.bottom - d,
+    }
+}
+
+/// Icônes au trait, dessinées sur une grille de 24 × 24.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Icon {
+    Server,
+    Albums,
+    Display,
+    Clock,
+    Calendar,
+    Pin,
+    Update,
+    Search,
+    Check,
+    Chevron,
+    Plus,
+    Refresh,
+    Next,
+    Trash,
+}
+
+struct Canvas(*mut GpGraphics);
+
+impl Canvas {
+    fn new(dc: HDC) -> Canvas {
+        gdiplus();
+        let mut g = std::ptr::null_mut();
+        unsafe {
+            GdipCreateFromHDC(dc, &mut g);
+            GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+            GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+            GdipSetInterpolationMode(g, InterpolationModeHighQualityBicubic);
+        }
+        Canvas(g)
+    }
+
+    fn round_path(r: Rf, rad: f32) -> *mut GpPath {
+        let mut p = std::ptr::null_mut();
+        unsafe {
+            GdipCreatePath(FillModeAlternate, &mut p);
+            let d = (rad.min(r.w / 2.0).min(r.h / 2.0) * 2.0).max(0.01);
+            GdipAddPathArc(p, r.x, r.y, d, d, 180.0, 90.0);
+            GdipAddPathArc(p, r.x + r.w - d, r.y, d, d, 270.0, 90.0);
+            GdipAddPathArc(p, r.x + r.w - d, r.y + r.h - d, d, d, 0.0, 90.0);
+            GdipAddPathArc(p, r.x, r.y + r.h - d, d, d, 90.0, 90.0);
+            GdipClosePathFigure(p);
+        }
+        p
+    }
+
+    fn fill_path(&self, p: *mut GpPath, color: u32) {
+        unsafe {
+            let mut b = std::ptr::null_mut();
+            GdipCreateSolidFill(color, &mut b);
+            GdipFillPath(self.0, b as *mut GpBrush, p);
+            GdipDeleteBrush(b as *mut GpBrush);
+        }
+    }
+
+    fn pen(color: u32, width: f32) -> *mut GpPen {
+        let mut pen = std::ptr::null_mut();
+        unsafe {
+            GdipCreatePen1(color, width, UnitPixel, &mut pen);
+            GdipSetPenStartCap(pen, LineCapRound);
+            GdipSetPenEndCap(pen, LineCapRound);
+            GdipSetPenLineJoin(pen, LineJoinRound);
+        }
+        pen
+    }
+
+    fn fill_round(&self, r: Rf, rad: f32, rgb: u32) {
+        let p = Self::round_path(r, rad);
+        self.fill_path(p, argb(rgb));
+        unsafe {
+            GdipDeletePath(p);
+        }
+    }
+
+    fn stroke_round(&self, r: Rf, rad: f32, color: u32, width: f32) {
+        let p = Self::round_path(r, rad);
+        unsafe {
+            let pen = Self::pen(color, width);
+            GdipDrawPath(self.0, pen, p);
+            GdipDeletePen(pen);
+            GdipDeletePath(p);
+        }
+    }
+
+    fn fill_circle(&self, cx: f32, cy: f32, rad: f32, color: u32) {
+        unsafe {
+            let mut b = std::ptr::null_mut();
+            GdipCreateSolidFill(color, &mut b);
+            GdipFillEllipse(self.0, b as *mut GpBrush, cx - rad, cy - rad, rad * 2.0, rad * 2.0);
+            GdipDeleteBrush(b as *mut GpBrush);
+        }
+    }
+
+    fn stroke_circle(&self, cx: f32, cy: f32, rad: f32, color: u32, width: f32) {
+        unsafe {
+            let pen = Self::pen(color, width);
+            GdipDrawEllipse(self.0, pen, cx - rad, cy - rad, rad * 2.0, rad * 2.0);
+            GdipDeletePen(pen);
+        }
+    }
+
+    fn lines(&self, pts: &[(f32, f32)], color: u32, width: f32) {
+        let pts: Vec<PointF> = pts.iter().map(|&(x, y)| PointF { X: x, Y: y }).collect();
+        unsafe {
+            let pen = Self::pen(color, width);
+            GdipDrawLines(self.0, pen, pts.as_ptr(), pts.len() as i32);
+            GdipDeletePen(pen);
+        }
+    }
+
+    fn arc(&self, (cx, cy, rad): (f32, f32, f32), start: f32, sweep: f32, color: u32, width: f32) {
+        unsafe {
+            let pen = Self::pen(color, width);
+            GdipDrawArc(self.0, pen, cx - rad, cy - rad, rad * 2.0, rad * 2.0, start, sweep);
+            GdipDeletePen(pen);
+        }
+    }
+
+    fn fill_poly(&self, pts: &[(f32, f32)], color: u32) {
+        let mut p = std::ptr::null_mut();
+        unsafe {
+            GdipCreatePath(FillModeAlternate, &mut p);
+            for w in pts.windows(2) {
+                GdipAddPathLine(p, w[0].0, w[0].1, w[1].0, w[1].1);
+            }
+            GdipClosePathFigure(p);
+            self.fill_path(p, color);
+            GdipDeletePath(p);
+        }
+    }
+
+    /// Vignette dans un rectangle arrondi (bords antialiasés : remplissage par une texture).
+    fn image_round(&self, c: &Cover, r: Rf, rad: f32) {
+        let side = c.side as i32;
+        unsafe {
+            let mut bmp = std::ptr::null_mut();
+            if GdipCreateBitmapFromScan0(
+                side,
+                side,
+                side * 4,
+                0x0026_200A, /* 32bppARGB */
+                Some(c.bgra.as_ptr()),
+                &mut bmp,
+            ) != Status(0)
+                || bmp.is_null()
+            {
+                return;
+            }
+            let mut tex = std::ptr::null_mut();
+            if GdipCreateTexture(bmp as *mut GpImage, WrapModeTileFlipXY, &mut tex) == Status(0) && !tex.is_null() {
+                GdipScaleTextureTransform(tex, r.w / side as f32, r.h / side as f32, MatrixOrderAppend);
+                GdipTranslateTextureTransform(tex, r.x, r.y, MatrixOrderAppend);
+                let p = Self::round_path(r, rad);
+                GdipFillPath(self.0, tex as *mut GpBrush, p);
+                GdipDeletePath(p);
+                GdipDeleteBrush(tex as *mut GpBrush);
+            }
+            GdipDisposeImage(bmp as *mut GpImage);
+        }
+    }
+
+    fn icon(&self, icon: Icon, x: f32, y: f32, size: f32, rgb: u32) {
+        let s = size / 24.0;
+        let p = |a: f32, b: f32| (x + a * s, y + b * s);
+        let c = argb(rgb);
+        let wd = (1.8 * s).max(1.2);
+        match icon {
+            Icon::Server => {
+                for top in [3.5, 13.0] {
+                    let (x0, y0) = p(3.5, top);
+                    self.stroke_round(
+                        Rf {
+                            x: x0,
+                            y: y0,
+                            w: 17.0 * s,
+                            h: 7.5 * s,
+                        },
+                        2.2 * s,
+                        c,
+                        wd,
+                    );
+                    let (dx, dy) = p(7.5, top + 3.75);
+                    self.fill_circle(dx, dy, 1.2 * s, c);
+                }
+            }
+            Icon::Albums => {
+                let (x0, y0) = p(3.0, 4.5);
+                self.stroke_round(
+                    Rf {
+                        x: x0,
+                        y: y0,
+                        w: 18.0 * s,
+                        h: 15.0 * s,
+                    },
+                    3.0 * s,
+                    c,
+                    wd,
+                );
+                self.lines(&[p(4.0, 17.5), p(9.5, 12.0), p(13.5, 16.0), p(16.0, 13.5), p(20.0, 17.5)], c, wd);
+                let (sx, sy) = p(15.5, 9.0);
+                self.fill_circle(sx, sy, 1.7 * s, c);
+            }
+            Icon::Display => {
+                let (x0, y0) = p(3.0, 4.0);
+                self.stroke_round(
+                    Rf {
+                        x: x0,
+                        y: y0,
+                        w: 18.0 * s,
+                        h: 12.0 * s,
+                    },
+                    2.2 * s,
+                    c,
+                    wd,
+                );
+                self.lines(&[p(12.0, 16.0), p(12.0, 20.0)], c, wd);
+                self.lines(&[p(8.0, 20.0), p(16.0, 20.0)], c, wd);
+            }
+            Icon::Clock => {
+                let (cx, cy) = p(12.0, 12.0);
+                self.stroke_circle(cx, cy, 8.5 * s, c, wd);
+                self.lines(&[p(12.0, 7.5), p(12.0, 12.0), p(15.0, 14.0)], c, wd);
+            }
+            Icon::Calendar => {
+                let (x0, y0) = p(3.5, 5.0);
+                self.stroke_round(
+                    Rf {
+                        x: x0,
+                        y: y0,
+                        w: 17.0 * s,
+                        h: 15.5 * s,
+                    },
+                    2.5 * s,
+                    c,
+                    wd,
+                );
+                self.lines(&[p(3.5, 10.0), p(20.5, 10.0)], c, wd);
+                self.lines(&[p(8.0, 3.0), p(8.0, 6.5)], c, wd);
+                self.lines(&[p(16.0, 3.0), p(16.0, 6.5)], c, wd);
+            }
+            Icon::Pin => {
+                let (cx, cy) = p(12.0, 10.0);
+                let rad = 6.5 * s;
+                let mut path = std::ptr::null_mut();
+                unsafe {
+                    GdipCreatePath(FillModeAlternate, &mut path);
+                    GdipAddPathArc(path, cx - rad, cy - rad, rad * 2.0, rad * 2.0, 140.0, 260.0);
+                    let (tx, ty) = p(12.0, 21.0);
+                    let e = 400.0f32.to_radians();
+                    GdipAddPathLine(path, cx + rad * e.cos(), cy + rad * e.sin(), tx, ty);
+                    GdipClosePathFigure(path);
+                    let pen = Self::pen(c, wd);
+                    GdipDrawPath(self.0, pen, path);
+                    GdipDeletePen(pen);
+                    GdipDeletePath(path);
+                }
+                self.stroke_circle(cx, cy, 2.3 * s, c, wd);
+            }
+            Icon::Update => {
+                self.lines(&[p(12.0, 4.0), p(12.0, 15.0)], c, wd);
+                self.lines(&[p(7.5, 10.5), p(12.0, 15.0), p(16.5, 10.5)], c, wd);
+                self.lines(&[p(5.0, 19.5), p(19.0, 19.5)], c, wd);
+            }
+            Icon::Search => {
+                let (cx, cy) = p(10.5, 10.5);
+                self.stroke_circle(cx, cy, 6.0 * s, c, wd);
+                self.lines(&[p(15.0, 15.0), p(20.0, 20.0)], c, wd);
+            }
+            Icon::Check => self.lines(&[p(5.0, 12.5), p(10.0, 17.0), p(19.0, 7.5)], c, wd * 1.2),
+            Icon::Chevron => self.lines(&[p(7.0, 9.5), p(12.0, 14.5), p(17.0, 9.5)], c, wd),
+            Icon::Plus => {
+                self.lines(&[p(12.0, 5.0), p(12.0, 19.0)], c, wd);
+                self.lines(&[p(5.0, 12.0), p(19.0, 12.0)], c, wd);
+            }
+            Icon::Refresh => {
+                let (cx, cy) = p(12.0, 12.0);
+                self.arc((cx, cy, 7.0 * s), 30.0, 290.0, c, wd);
+                self.lines(&[p(19.5, 4.5), p(19.0, 9.0), p(14.5, 8.5)], c, wd);
+            }
+            Icon::Next => {
+                self.fill_poly(&[p(6.0, 5.5), p(15.5, 12.0), p(6.0, 18.5), p(6.0, 5.5)], c);
+                self.lines(&[p(18.5, 5.5), p(18.5, 18.5)], c, wd * 1.2);
+            }
+            Icon::Trash => {
+                self.lines(&[p(4.0, 7.0), p(20.0, 7.0)], c, wd);
+                self.lines(&[p(9.0, 7.0), p(9.5, 4.0), p(14.5, 4.0), p(15.0, 7.0)], c, wd);
+                self.lines(&[p(6.0, 7.0), p(7.0, 20.0), p(17.0, 20.0), p(18.0, 7.0)], c, wd);
+            }
+        }
+    }
+}
+
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        unsafe {
+            GdipDeleteGraphics(self.0);
+        }
+    }
+}
+
+/// Dessin hors écran, recopié d'un coup (pas de scintillement).
+struct Buffer {
+    dc: HDC,
+    bmp: HBITMAP,
+    old: HGDIOBJ,
+    target: HDC,
+    r: RECT,
+}
+
+impl Buffer {
+    fn new(target: HDC, r: RECT) -> Buffer {
+        unsafe {
+            let dc = CreateCompatibleDC(Some(target));
+            let bmp = CreateCompatibleBitmap(target, (r.right - r.left).max(1), (r.bottom - r.top).max(1));
+            let old = SelectObject(dc, HGDIOBJ(bmp.0));
+            SetBkMode(dc, TRANSPARENT);
+            Buffer { dc, bmp, old, target, r }
+        }
+    }
+
+    fn fill(&self, r: RECT, rgb: u32) {
+        unsafe {
+            let b = CreateSolidBrush(colorref(rgb));
+            FillRect(self.dc, &r, b);
+            let _ = DeleteObject(HGDIOBJ(b.0));
+        }
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        unsafe {
+            let r = self.r;
+            let _ = BitBlt(
+                self.target,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                Some(self.dc),
+                0,
+                0,
+                SRCCOPY,
+            );
+            SelectObject(self.dc, self.old);
+            let _ = DeleteObject(HGDIOBJ(self.bmp.0));
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
+// ---------- polices ----------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Font {
+    Body,
+    Semi,
+    Small,
+    Title,
+}
+
+struct Fonts {
+    body: HFONT,
+    semi: HFONT,
+    small: HFONT,
+    title: HFONT,
+    brand: HFONT,
+    nav: HFONT,
+    /// Hauteur d'une ligne de texte courant (zones de saisie).
+    line: i32,
+}
+
+/// La police est installée.
+fn font_exists(name: &str) -> bool {
+    unsafe extern "system" fn found(_: *const LOGFONTW, _: *const TEXTMETRICW, _: u32, lp: LPARAM) -> i32 {
+        *(lp.0 as *mut bool) = true;
+        0
+    }
+    let mut lf = LOGFONTW {
+        lfCharSet: FONT_CHARSET(1),
+        ..Default::default()
+    };
+    for (d, s) in lf.lfFaceName.iter_mut().zip(name.encode_utf16().take(31)) {
+        *d = s;
+    }
+    let mut ok = false;
+    unsafe {
+        let dc = GetDC(None);
+        EnumFontFamiliesExW(dc, &lf, Some(found), LPARAM(&mut ok as *mut bool as isize), 0);
+        ReleaseDC(None, dc);
+    }
+    ok
+}
+
+/// Polices de Windows : Segoe UI Variable (Windows 11), sinon Segoe UI.
+fn faces() -> &'static (String, String) {
+    static FACES: OnceLock<(String, String)> = OnceLock::new();
+    FACES.get_or_init(|| {
+        if font_exists("Segoe UI Variable Text") {
+            ("Segoe UI Variable Text".into(), "Segoe UI Variable Display".into())
+        } else {
+            ("Segoe UI".into(), "Segoe UI".into())
+        }
+    })
+}
+
+fn make_font(face: &str, tenths_pt: i32, weight: i32, dpi: u32) -> HFONT {
+    let mut lf = LOGFONTW {
+        lfHeight: -mul_div(tenths_pt, dpi, 720),
+        lfWeight: weight,
+        lfCharSet: FONT_CHARSET(1),
+        lfQuality: FONT_QUALITY(5), // ClearType
+        ..Default::default()
+    };
+    for (d, s) in lf.lfFaceName.iter_mut().zip(face.encode_utf16().take(31)) {
+        *d = s;
+    }
+    unsafe { CreateFontIndirectW(&lf) }
+}
+
+impl Fonts {
+    fn new(dpi: u32) -> Fonts {
+        let (text, display) = faces();
+        let body = make_font(text, 100, 400, dpi);
+        let line = text_h(body, "Ag", 1000) + mul_div(2, dpi, 96);
+        Fonts {
+            body,
+            semi: make_font(text, 100, 600, dpi),
+            small: make_font(text, 90, 400, dpi),
+            title: make_font(display, 190, 600, dpi),
+            brand: make_font(display, 115, 600, dpi),
+            nav: make_font(text, 105, 400, dpi),
+            line,
+        }
+    }
+
+    fn get(&self, f: Font) -> HFONT {
+        match f {
+            Font::Body => self.body,
+            Font::Semi => self.semi,
+            Font::Small => self.small,
+            Font::Title => self.title,
+        }
+    }
+}
+
+impl Drop for Fonts {
+    fn drop(&mut self) {
+        for f in [self.body, self.semi, self.small, self.title, self.brand, self.nav] {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(f.0));
+            }
+        }
+    }
+}
+
+fn draw_text(dc: HDC, font: HFONT, s: &str, r: RECT, rgb: u32, flags: DRAW_TEXT_FORMAT) {
+    let mut buf: Vec<u16> = s.encode_utf16().collect();
+    if buf.is_empty() {
+        return;
+    }
+    unsafe {
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        SetTextColor(dc, colorref(rgb));
+        SetBkMode(dc, TRANSPARENT);
+        let mut r = r;
+        DrawTextW(dc, &mut buf, &mut r, flags | DT_NOPREFIX);
+        SelectObject(dc, old);
+    }
+}
+
+/// Hauteur du texte coupé à la largeur donnée.
+fn text_h(font: HFONT, s: &str, width: i32) -> i32 {
+    let mut buf: Vec<u16> = s.encode_utf16().collect();
+    if buf.is_empty() {
+        return 0;
+    }
+    unsafe {
+        let dc = GetDC(None);
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: width.max(1),
+            bottom: 0,
+        };
+        DrawTextW(dc, &mut buf, &mut r, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+        SelectObject(dc, old);
+        ReleaseDC(None, dc);
+        r.bottom - r.top
+    }
+}
+
+/// Largeur d'un texte sur une ligne.
+fn text_w(font: HFONT, s: &str) -> i32 {
+    let mut buf: Vec<u16> = s.encode_utf16().collect();
+    if buf.is_empty() {
+        return 0;
+    }
+    unsafe {
+        let dc = GetDC(None);
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        let mut r = RECT::default();
+        DrawTextW(dc, &mut buf, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, old);
+        ReleaseDC(None, dc);
+        r.right - r.left
+    }
+}
 
 // ---------- état partagé ----------
 
@@ -201,10 +892,13 @@ thread_local! {
 static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Albums chargés dans la fenêtre au dernier test de connexion réussi (vérification).
 static LOADED_ALBUMS: AtomicUsize = AtomicUsize::new(0);
+/// Contrôle survolé par la souris.
+static HOT: AtomicIsize = AtomicIsize::new(0);
 
 /// Résultats des tâches de fond, par fenêtre (handle), récupérés sur le thread de l'interface.
 enum Done {
     Albums { quiet: bool, res: Result<Vec<AlbumInfo>, String> },
+    Cover,
     Next(Result<String, String>),
 }
 static DONE: Mutex<Vec<(isize, Done)>> = Mutex::new(Vec::new());
@@ -250,7 +944,7 @@ pub fn open(settings: Arc<Settings>) {
 }
 
 /// À appeler dans la boucle de messages avant TranslateMessage : navigation au clavier de la
-/// fenêtre (Tab, Entrée, Échap, Alt+lettre, Ctrl+Tab). true : le message a été traité.
+/// fenêtre (Tab, Entrée, Échap, Ctrl+Tab). true : le message a été traité.
 pub fn pre_translate(msg: &MSG) -> bool {
     let Some(w) = current() else { return false };
     unsafe {
@@ -259,11 +953,11 @@ pub fn pre_translate(msg: &MSG) -> bool {
             && GetKeyState(VK_CONTROL) < 0
             && (msg.hwnd == w.hwnd || IsChild(w.hwnd, msg.hwnd).as_bool())
         {
-            let n = PAGE_NAMES.len();
+            let n = PAGES.len();
             let d = if GetKeyState(VK_SHIFT) < 0 { n - 1 } else { 1 };
             let page = w.st.borrow().page;
             w.show_page((page + d) % n);
-            let _ = SetFocus(Some(w.c.tab));
+            let _ = SetFocus(Some(w.c.nav[(page + d) % n]));
             return true;
         }
         IsDialogMessageW(w.hwnd, msg).as_bool()
@@ -274,10 +968,6 @@ pub fn pre_translate(msg: &MSG) -> bool {
 
 fn send(h: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     unsafe { SendMessageW(h, msg, Some(WPARAM(wp)), Some(LPARAM(lp))).0 }
-}
-
-fn send_ptr<T>(h: HWND, msg: u32, wp: usize, p: &T) -> isize {
-    send(h, msg, wp, p as *const T as isize)
 }
 
 fn send_str(h: HWND, msg: u32, wp: usize, s: &str) -> isize {
@@ -310,6 +1000,10 @@ fn move_win(h: HWND, x: i32, y: i32, w: i32, ht: i32) {
     }
 }
 
+fn move_rect(h: HWND, r: RECT) {
+    move_win(h, r.left, r.top, r.right - r.left, r.bottom - r.top);
+}
+
 fn show_win(h: HWND, on: bool) {
     unsafe {
         let _ = ShowWindow(h, if on { SW_SHOW } else { SW_HIDE });
@@ -320,22 +1014,7 @@ fn enable(h: HWND, on: bool) {
     unsafe {
         let _ = EnableWindow(h, on);
     }
-}
-
-fn is_checked(h: HWND) -> bool {
-    send(h, BM_GETCHECK, 0, 0) == 1
-}
-
-fn set_checked(h: HWND, on: bool) {
-    send(h, BM_SETCHECK, on as usize, 0);
-}
-
-fn combo_sel(h: HWND) -> i32 {
-    send(h, CB_GETCURSEL, 0, 0) as i32
-}
-
-fn set_combo(h: HWND, i: usize) {
-    send(h, CB_SETCURSEL, i, 0);
+    invalidate(h);
 }
 
 fn client_rect(h: HWND) -> RECT {
@@ -347,548 +1026,373 @@ fn client_rect(h: HWND) -> RECT {
 }
 
 fn invalidate(h: HWND) {
-    unsafe {
-        let _ = InvalidateRect(Some(h), None, true);
+    if !h.is_invalid() {
+        unsafe {
+            let _ = InvalidateRect(Some(h), None, false);
+        }
     }
-}
-
-fn sys_color(i: SYS_COLOR_INDEX) -> u32 {
-    unsafe { GetSysColor(i) }
 }
 
 fn mul_div(v: i32, num: u32, den: u32) -> i32 {
     ((v as i64 * num as i64 + (den as i64) / 2) / den as i64) as i32
 }
 
-/// Police des boîtes de dialogue de Windows (Segoe UI 9 pt) à la résolution donnée.
-fn message_font(dpi: u32) -> HFONT {
-    let mut ncm = NONCLIENTMETRICSW {
-        cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
-        ..Default::default()
-    };
-    let mut lf = LOGFONTW {
-        lfHeight: -mul_div(9, dpi, 72),
-        lfWeight: 400,
-        lfCharSet: FONT_CHARSET(1), // DEFAULT_CHARSET
-        lfQuality: FONT_QUALITY(5), // CLEARTYPE_QUALITY
-        ..Default::default()
-    };
-    for (d, s) in lf.lfFaceName.iter_mut().zip("Segoe UI".encode_utf16()) {
-        *d = s;
-    }
-    unsafe {
-        if SystemParametersInfoForDpi(
-            0x29, /* SPI_GETNONCLIENTMETRICS */
-            ncm.cbSize,
-            Some(&mut ncm as *mut _ as *mut _),
-            0,
-            dpi,
-        )
-        .is_ok()
-            && ncm.lfMessageFont.lfHeight != 0
-        {
-            lf = ncm.lfMessageFont;
-        }
-        CreateFontIndirectW(&lf)
-    }
-}
-
-/// Hauteur du texte du contrôle une fois coupé à la largeur donnée.
-fn text_height(h: HWND, font: HFONT, width: i32) -> i32 {
-    let s = get_text(h);
-    if s.is_empty() {
-        return 0;
-    }
-    let mut buf: Vec<u16> = s.encode_utf16().collect();
-    unsafe {
-        let dc = GetDC(Some(h));
-        if dc.is_invalid() {
-            return 0;
-        }
-        let old = SelectObject(dc, HGDIOBJ(font.0));
-        let mut r = RECT {
-            left: 0,
-            top: 0,
-            right: width.max(1),
-            bottom: 0,
-        };
-        DrawTextW(dc, &mut buf, &mut r, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
-        SelectObject(dc, old);
-        ReleaseDC(Some(h), dc);
-        r.bottom - r.top
-    }
-}
-
-/// Heure choisie, "" si la case « aucune heure » est décochée.
-fn clock_value(h: HWND) -> String {
-    let st = SYSTEMTIME::default();
-    if send_ptr(h, DTM_GETSYSTEMTIME, 0, &st) != GDT_VALID {
-        return String::new();
-    }
-    format!("{:02}:{:02}", st.wHour, st.wMinute)
-}
-
-/// Affiche l'heure v ; vide : case « aucune heure » décochée, avec `default` proposée quand on
-/// la coche (plutôt que l'heure qu'il est).
-fn set_clock(h: HWND, v: &str, default: &str) {
-    let set = |m: u32| {
-        let st = SYSTEMTIME {
-            wYear: 2000,
-            wMonth: 1,
-            wDay: 1,
-            wHour: (m / 60) as u16,
-            wMinute: (m % 60) as u16,
-            ..Default::default()
-        };
-        send_ptr(h, DTM_SETSYSTEMTIME, GDT_VALID as usize, &st);
-    };
-    match parse_clock(v) {
-        Some(m) => set(m),
-        None => {
-            set(parse_clock(default).unwrap_or(0));
-            send(h, DTM_SETSYSTEMTIME, GDT_NONE, 0);
-        }
-    }
+fn hwnd_of(v: isize) -> HWND {
+    HWND(v as *mut _)
 }
 
 /// Résultat d'une tâche de fond, remis à la fenêtre `hwnd` sur le thread de l'interface.
 fn finish(hwnd: isize, d: Done) {
     lock(&DONE).push((hwnd, d));
     unsafe {
-        let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP_DONE, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(Some(hwnd_of(hwnd)), WM_APP_DONE, WPARAM(0), LPARAM(0));
     }
+}
+
+// ---------- contrôles dessinés par l'appli ----------
+
+/// Fond derrière un contrôle (pour ses coins arrondis).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Bg {
+    Page,
+    Card,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind {
+    Nav(usize),
+    Primary,
+    Secondary,
+    Danger,
+    /// Ligne de réglage entière : titre, description et interrupteur.
+    Toggle,
+    /// Liste déroulante (menu de Windows à l'ouverture).
+    Select(&'static [Choice]),
+    Rule(usize),
+}
+
+impl Kind {
+    /// Bouton « poussoir » : la touche Entrée l'active quand il a le focus.
+    fn push_like(&self) -> bool {
+        !matches!(self, Kind::Toggle | Kind::Select(_))
+    }
+}
+
+#[derive(Clone)]
+struct Owner {
+    kind: Kind,
+    text: String,
+    desc: String,
+    icon: Option<Icon>,
+    on: bool,
+    sel: usize,
+    bg: Bg,
+}
+
+/// Survol : le contrôle se redessine à l'entrée et à la sortie de la souris.
+unsafe extern "system" fn owner_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    match msg {
+        WM_ERASEBKGND => return LRESULT(1),
+        BM_SETSTYLE => return LRESULT(0), // IsDialogMessage ne doit pas lui retirer son dessin personnalisé
+        WM_GETDLGCODE => {
+            let push = current()
+                .and_then(|w| w.owners.borrow().get(&(h.0 as isize)).map(|o| o.kind.push_like()))
+                .unwrap_or(false);
+            if push {
+                return LRESULT(DLGC_BUTTON | DLGC_UNDEFPUSHBUTTON);
+            }
+        }
+        WM_MOUSEMOVE => {
+            let old = HOT.swap(h.0 as isize, Ordering::SeqCst);
+            if old != h.0 as isize {
+                invalidate(hwnd_of(old));
+                invalidate(h);
+                let mut t = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: h,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut t);
+            }
+        }
+        WM_MOUSELEAVE if HOT.compare_exchange(h.0 as isize, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() => invalidate(h),
+        _ => {}
+    }
+    DefSubclassProc(h, msg, wp, lp)
+}
+
+/// Crée un contrôle enfant (police courante, identifiant).
+fn create(hinst: HINSTANCE, parent: HWND, class: PCWSTR, text: &str, style: u32, ex: u32, id: usize) -> HWND {
+    let t = wide(text);
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(ex),
+            class,
+            PCWSTR(t.as_ptr()),
+            WINDOW_STYLE(style | WS_CHILD | WS_VISIBLE),
+            0,
+            0,
+            0,
+            0,
+            Some(parent),
+            Some(HMENU(id as *mut _)),
+            Some(hinst),
+            None,
+        )
+    }
+    .unwrap_or_else(|e| panic!("création d'un contrôle : {e}"))
+}
+
+fn create_owner(hinst: HINSTANCE, parent: HWND, id: usize, text: &str) -> HWND {
+    let h = create(hinst, parent, w!("BUTTON"), text, BS_OWNERDRAW | BS_NOTIFY | WS_TABSTOP, 0, id);
+    unsafe {
+        let _ = SetWindowSubclass(h, Some(owner_proc), 1, 0);
+    }
+    h
 }
 
 // ---------- contrôles ----------
 
-/// Handles des contrôles, créés une fois pour toutes.
+/// Handles des contrôles permanents.
 #[derive(Default, Clone, Copy)]
 struct Ctl {
-    status: HWND,
-    tab: HWND,
-    pages: [HWND; 7],
+    nav: [HWND; 7],
+    content: HWND,
     b_next: HWND,
-    msg: HWND,
-    b_save: HWND,
     b_close: HWND,
+    b_save: HWND,
     // Serveur
-    l_url: HWND,
     e_url: HWND,
-    w_http: HWND,
-    l_key: HWND,
     e_key: HWND,
-    h_key: HWND,
-    c_insecure: HWND,
-    h_pin: HWND,
+    t_insecure: HWND,
     b_test: HWND,
-    test_msg: HWND,
     // Albums
     e_filter: HWND,
-    albums_msg: HWND,
     b_reload: HWND,
-    lv_albums: HWND,
-    album_count: HWND,
+    grid_albums: HWND,
     // Affichage
-    l_interval: HWND,
     e_interval: HWND,
-    ud_interval: HWND,
-    s_minutes: HWND,
-    l_style: HWND,
-    cb_style: HWND,
-    l_size: HWND,
-    cb_size: HWND,
-    l_monitor: HWND,
-    cb_monitor: HWND,
-    l_offline: HWND,
+    s_style: HWND,
+    s_size: HWND,
+    s_monitor: HWND,
     e_offline: HWND,
-    ud_offline: HWND,
-    h_offline: HWND,
-    c_split: HWND,
-    c_landscape: HWND,
-    c_start: HWND,
-    c_unlock: HWND,
-    excluded_info: HWND,
+    t_split: HWND,
+    t_landscape: HWND,
+    t_start: HWND,
+    t_unlock: HWND,
     b_show_excluded: HWND,
     // Planification
-    l_hours: HWND,
-    dt_from: HWND,
-    s_to: HWND,
-    dt_to: HWND,
-    h_hours: HWND,
-    c_battery: HWND,
-    c_metered: HWND,
-    c_fullscreen: HWND,
-    h_pauses: HWND,
-    c_preload: HWND,
-    h_preload: HWND,
+    e_from: HWND,
+    e_to: HWND,
+    t_battery: HWND,
+    t_metered: HWND,
+    t_fullscreen: HWND,
+    t_preload: HWND,
     // Saisons et heures
-    h_rules: HWND,
-    lb_rules: HWND,
     b_add_rule: HWND,
     b_del_rule: HWND,
-    l_season: HWND,
-    cb_season: HWND,
-    l_rhours: HWND,
-    dt_rfrom: HWND,
-    s_rto: HWND,
-    dt_rto: HWND,
-    l_ralbums: HWND,
-    lv_rule: HWND,
-    // Légende et écran de verrouillage
-    c_place: HWND,
-    c_date: HWND,
-    l_caption: HWND,
-    cb_caption: HWND,
-    c_link: HWND,
-    h_link: HWND,
-    c_lock: HWND,
-    h_lock: HWND,
+    s_season: HWND,
+    e_rfrom: HWND,
+    e_rto: HWND,
+    grid_rule: HWND,
+    // Légende
+    t_place: HWND,
+    t_date: HWND,
+    s_caption: HWND,
+    t_link: HWND,
+    t_lock: HWND,
     // Mises à jour
-    c_update: HWND,
-    h_update_portable: HWND,
-    h_update: HWND,
-    s_version: HWND,
+    t_update: HWND,
 }
 
-/// Création des contrôles : police, identifiants, ordre de tabulation.
+/// Création des contrôles : identifiants, ordre de tabulation, pages.
 struct Builder {
     hinst: HINSTANCE,
     font: HFONT,
-    dpi: u32,
     next_id: usize,
-    ctls: Vec<HWND>,
-    children: Vec<(HWND, Vec<HWND>)>,
-    colors: HashMap<isize, u32>,
+    owners: HashMap<isize, Owner>,
+    edits: Vec<HWND>,
+    pages: [Vec<HWND>; 7],
+    page: usize,
 }
 
 impl Builder {
-    fn add_id(&mut self, parent: HWND, class: &str, text: &str, style: u32, ex: u32, id: usize) -> HWND {
-        let (c, t) = (wide(class), wide(text));
-        let h = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE(ex),
-                PCWSTR(c.as_ptr()),
-                PCWSTR(t.as_ptr()),
-                WINDOW_STYLE(style | WS_CHILD | WS_VISIBLE),
-                0,
-                0,
-                0,
-                0,
-                Some(parent),
-                Some(HMENU(id as *mut _)),
-                Some(self.hinst),
-                None,
-            )
-        };
-        let h = h.unwrap_or_else(|e| panic!("création du contrôle {class} : {e}"));
-        send(h, WM_SETFONT, self.font.0 as usize, 0);
-        self.ctls.push(h);
-        match self.children.iter_mut().find(|(p, _)| *p == parent) {
-            Some((_, list)) => list.push(h),
-            None => self.children.push((parent, vec![h])),
-        }
-        h
-    }
-
-    fn add(&mut self, parent: HWND, class: &str, text: &str, style: u32, ex: u32) -> HWND {
+    fn id(&mut self) -> usize {
         self.next_id += 1;
-        let id = self.next_id;
-        self.add_id(parent, class, text, style, ex, id)
+        self.next_id
     }
 
-    fn label(&mut self, p: HWND, text: &str) -> HWND {
-        self.add(p, "STATIC", text, SS_LEFTNOWORDWRAP | SS_CENTERIMAGE, 0)
-    }
-
-    fn line(&mut self, p: HWND) -> HWND {
-        self.add(
-            p,
-            "STATIC",
-            "",
-            SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS | SS_NOPREFIX | SS_CENTERIMAGE,
-            0,
-        )
-    }
-
-    fn text(&mut self, p: HWND, text: &str) -> HWND {
-        self.add(p, "STATIC", text, SS_LEFT | SS_NOPREFIX, 0)
-    }
-
-    fn hint(&mut self, p: HWND, text: &str) -> HWND {
-        let h = self.text(p, text);
-        self.colors.insert(h.0 as isize, sys_color(COLOR_GRAYTEXT));
-        h
-    }
-
-    fn check(&mut self, p: HWND, text: &str) -> HWND {
-        self.add(p, "BUTTON", text, BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 0)
-    }
-
-    fn button(&mut self, p: HWND, text: &str) -> HWND {
-        self.add(p, "BUTTON", text, BS_PUSHBUTTON | WS_TABSTOP, 0)
-    }
-
-    fn edit(&mut self, p: HWND, style: u32) -> HWND {
-        self.add(p, "EDIT", "", ES_AUTOHSCROLL | WS_TABSTOP | style, WS_EX_CLIENTEDGE)
-    }
-
-    fn combo(&mut self, p: HWND, list: &[Choice]) -> HWND {
-        let h = self.add(p, "COMBOBOX", "", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 0);
-        for c in list {
-            send_str(h, CB_ADDSTRING, 0, c.1);
-        }
-        set_combo(h, 0);
-        h
-    }
-
-    /// Zone de saisie numérique avec ses flèches.
-    fn number(&mut self, p: HWND, lo: i32, hi: i32) -> (HWND, HWND) {
-        let e = self.edit(p, ES_NUMBER);
-        let ud = self.add(
-            p,
-            "msctls_updown32",
-            "",
-            UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS | UDS_HOTTRACK,
-            0,
+    fn owner_id(&mut self, parent: HWND, id: usize, kind: Kind, text: &str, desc: &str, icon: Option<Icon>) -> HWND {
+        let h = create_owner(self.hinst, parent, id, text);
+        let bg = if matches!(kind, Kind::Toggle | Kind::Select(_)) {
+            Bg::Card
+        } else {
+            Bg::Page
+        };
+        self.owners.insert(
+            h.0 as isize,
+            Owner {
+                kind,
+                text: text.to_string(),
+                desc: desc.to_string(),
+                icon,
+                on: false,
+                sel: 0,
+                bg,
+            },
         );
-        send(ud, UDM_SETBUDDY, e.0 as usize, 0);
-        send(ud, UDM_SETRANGE32, lo as usize, hi as isize);
-        (e, ud)
-    }
-
-    /// Heure « HH:mm » avec une case « aucune heure ».
-    fn clock(&mut self, p: HWND) -> HWND {
-        let h = self.add(p, "SysDateTimePick32", "", DTS_TIMEFORMAT | DTS_SHOWNONE | WS_TABSTOP, 0);
-        send_str(h, DTM_SETFORMATW, 0, "HH':'mm");
         h
     }
 
-    /// Liste d'albums à cocher.
-    fn list(&mut self, p: HWND, columns: &[&str]) -> HWND {
-        let mut style = LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL | LVS_NOSORTHEADER | WS_TABSTOP;
-        if columns.len() == 1 {
-            style |= LVS_NOCOLUMNHEADER;
+    fn owner(&mut self, parent: HWND, kind: Kind, text: &str, desc: &str, icon: Option<Icon>) -> HWND {
+        let id = self.id();
+        let h = self.owner_id(parent, id, kind, text, desc, icon);
+        self.pages[self.page].push(h);
+        h
+    }
+
+    fn toggle(&mut self, p: HWND, title: &str, desc: &str) -> HWND {
+        self.owner(p, Kind::Toggle, title, desc, None)
+    }
+
+    fn select(&mut self, p: HWND, list: &'static [Choice]) -> HWND {
+        self.owner(p, Kind::Select(list), "", "", None)
+    }
+
+    fn edit(&mut self, p: HWND, style: u32, cue: &str) -> HWND {
+        let id = self.id();
+        let h = create(self.hinst, p, w!("EDIT"), "", ES_AUTOHSCROLL | WS_TABSTOP | style, 0, id);
+        send(h, WM_SETFONT, self.font.0 as usize, 0);
+        if !cue.is_empty() {
+            send_str(h, EM_SETCUEBANNER, 1, cue);
         }
-        let h = self.add(p, "SysListView32", "", style, WS_EX_CLIENTEDGE);
-        send(
-            h,
-            LVM_SETEXTENDEDLISTVIEWSTYLE,
-            0,
-            LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER,
-        );
-        unsafe {
-            let _ = SetWindowTheme(h, w!("Explorer"), PCWSTR::null());
-        }
-        for (i, name) in columns.iter().enumerate() {
-            let mut t = wide(name);
-            let col = LVCOLUMNW {
-                mask: LVCF_TEXT | LVCF_WIDTH | LVCF_FMT,
-                fmt: if i > 0 { LVCFMT_RIGHT } else { Default::default() },
-                cx: mul_div(100, self.dpi, 96),
-                pszText: PWSTR(t.as_mut_ptr()),
-                ..Default::default()
-            };
-            send_ptr(h, LVM_INSERTCOLUMNW, i, &col);
-        }
+        self.edits.push(h);
+        self.pages[self.page].push(h);
+        h
+    }
+
+    fn grid(&mut self, p: HWND) -> HWND {
+        let id = self.id();
+        let h = create(self.hinst, p, CLASS_GRID, "", WS_TABSTOP | WS_VSCROLL, 0, id);
+        self.pages[self.page].push(h);
         h
     }
 }
 
 fn build(b: &mut Builder, main: HWND) -> Ctl {
-    let mut c = Ctl {
-        status: b.line(main),
-        ..Default::default()
-    };
-    b.colors.insert(c.status.0 as isize, sys_color(COLOR_GRAYTEXT));
-    let class = unsafe { String::from_utf16_lossy(CLASS_PAGE.as_wide()) };
-    for p in c.pages.iter_mut() {
-        *p = b.add(main, &class, "", WS_CLIPCHILDREN | WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT);
+    let mut c = Ctl::default();
+    for (i, (name, icon)) in PAGES.iter().enumerate() {
+        let id = b.id();
+        c.nav[i] = b.owner_id(main, id, Kind::Nav(i), name, "", Some(*icon));
     }
-
-    // Serveur
-    let p = c.pages[0];
-    c.l_url = b.label(p, "&URL du serveur");
-    c.e_url = b.edit(p, 0);
-    send_str(c.e_url, EM_SETCUEBANNER, 0, "https://immich.exemple.fr");
-    c.w_http = b.text(
-        p,
-        "Connexion non chiffrée (http://) vers un serveur hors réseau local : le token et les photos circulent en clair. \
-         Préfère https://.",
-    );
-    b.colors.insert(c.w_http.0 as isize, COLOR_ERR);
-    c.l_key = b.label(p, "T&oken (clé API)");
-    c.e_key = b.edit(p, ES_PASSWORD);
-    c.h_key = b.hint(
-        p,
-        "Immich → Paramètres du compte → Clés API. Permissions : album.read, asset.read, asset.view, asset.download \
-         (et asset.update pour « Ajouter aux favoris »).",
-    );
-    c.c_insecure = b.check(p, "Accepter un certificat auto-signé");
-    c.h_pin = b.hint(p, "");
-    c.b_test = b.button(p, "&Tester et charger les albums");
-    c.test_msg = b.text(p, "");
-
-    // Albums
-    let p = c.pages[1];
-    c.e_filter = b.edit(p, 0);
-    send_str(c.e_filter, EM_SETCUEBANNER, 0, "Filtrer…");
-    c.albums_msg = b.line(p);
-    c.b_reload = b.button(p, "&Recharger la liste");
-    c.lv_albums = b.list(p, &["Album", "Éléments"]);
-    c.album_count = b.line(p);
-
-    // Affichage
-    let p = c.pages[2];
-    c.l_interval = b.label(p, "Changer d'image toutes les");
-    (c.e_interval, c.ud_interval) = b.number(p, 1, 99999);
-    c.s_minutes = b.label(p, "minutes");
-    c.l_style = b.label(p, "Ajustement");
-    c.cb_style = b.combo(p, STYLES);
-    c.l_size = b.label(p, "Qualité");
-    c.cb_size = b.combo(p, SIZES);
-    c.l_monitor = b.label(p, "Plusieurs écrans");
-    c.cb_monitor = b.combo(p, MONITORS);
-    c.l_offline = b.label(p, "Photos gardées hors ligne");
-    (c.e_offline, c.ud_offline) = b.number(p, 0, 500);
-    c.h_offline = b.hint(
-        p,
-        "Si Immich est injoignable (déplacement, VPN coupé…), la rotation continue avec les dernières photos \
-         téléchargées. 0 = désactivé.",
-    );
-    c.c_split = b.check(p, "Écran très large (32:9, « deux écrans en un ») : deux photos côte à côte");
-    c.c_landscape = b.check(p, "Uniquement les photos en paysage");
-    c.c_start = b.check(p, "Changer d'image au démarrage");
-    c.c_unlock = b.check(p, "Changer d'image à chaque déverrouillage du PC");
-    c.excluded_info = b.hint(p, "");
-    c.b_show_excluded = b.button(p, "Les réafficher");
-
-    // Planification
-    let p = c.pages[3];
-    c.l_hours = b.label(p, "Changer d'image de");
-    c.dt_from = b.clock(p);
-    c.s_to = b.label(p, "à");
-    c.dt_to = b.clock(p);
-    c.h_hours = b.hint(
-        p,
-        "Décoche les deux heures pour changer toute la journée. Une plage comme 22:00 → 07:00 passe par minuit.",
-    );
-    c.c_battery = b.check(p, "Ne pas changer sur batterie");
-    c.c_metered = b.check(
-        p,
-        "Ne pas changer sur une connexion limitée (partage de connexion, forfait de données)",
-    );
-    c.c_fullscreen = b.check(
-        p,
-        "Ne pas changer pendant une application en plein écran (jeu, vidéo, présentation)",
-    );
-    c.h_pauses = b.hint(
-        p,
-        "Ces réglages ne concernent que les changements automatiques : « Image suivante » fonctionne toujours. \
-         Le changement se fait dès que la condition disparaît.",
-    );
-    c.c_preload = b.check(p, "Télécharger la photo suivante à l'avance");
-    c.h_preload = b.hint(
-        p,
-        "Le changement suivant est alors immédiat et ne dépend plus du réseau (utile au déverrouillage du PC).",
-    );
-
-    // Saisons et heures
-    let p = c.pages[4];
-    c.h_rules = b.hint(
-        p,
-        "Quand une règle s'applique, ses albums remplacent les albums habituels (onglet Albums). Plusieurs règles \
-         en même temps : leurs albums sont réunis.",
-    );
-    c.lb_rules = b.add(
-        p,
-        "LISTBOX",
+    let id = b.id();
+    c.content = create(
+        b.hinst,
+        main,
+        CLASS_CONTENT,
         "",
-        LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP,
-        WS_EX_CLIENTEDGE,
+        WS_CLIPCHILDREN | WS_VSCROLL,
+        WS_EX_CONTROLPARENT,
+        id,
     );
-    c.b_add_rule = b.button(p, "&Ajouter une règle");
-    c.b_del_rule = b.button(p, "Supprimer");
-    c.l_season = b.label(p, "Saison");
-    c.cb_season = b.combo(p, SEASONS);
-    c.l_rhours = b.label(p, "De");
-    c.dt_rfrom = b.clock(p);
-    c.s_rto = b.label(p, "à");
-    c.dt_rto = b.clock(p);
-    c.l_ralbums = b.label(p, "Albums de cette règle :");
-    c.lv_rule = b.list(p, &["Album"]);
+    let p = c.content;
 
-    // Légende et écran de verrouillage
-    let p = c.pages[5];
-    c.c_place = b.check(p, "Afficher le lieu sur l'image (ville, région, pays — photos géolocalisées)");
-    c.c_date = b.check(p, "Afficher le mois et l'année");
-    c.l_caption = b.label(p, "Position du texte");
-    c.cb_caption = b.combo(p, CAPTIONS);
-    c.c_link = b.check(p, "Icône « Voir cette photo dans Immich » sur le bureau");
-    c.h_link = b.hint(
-        p,
-        "Le fond d'écran lui-même n'est pas cliquable sous Windows : cette icône (ou un clic gauche sur l'icône près \
-         de l'horloge) ouvre la photo affichée.",
-    );
-    c.c_lock = b.check(p, "Appliquer aussi à l'écran de verrouillage");
-    c.h_lock = b.hint(
-        p,
-        "Dans Windows : Paramètres → Personnalisation → Écran de verrouillage → « Image » (et non « Windows à la une »).",
-    );
+    b.page = PAGE_SERVER;
+    c.e_url = b.edit(p, 0, "https://immich.exemple.fr");
+    c.e_key = b.edit(p, ES_PASSWORD, "");
+    c.t_insecure = b.toggle(p, "Accepter un certificat auto-signé", PIN_HINT);
+    c.b_test = b.owner(p, Kind::Primary, "Tester la connexion", "", Some(Icon::Refresh));
 
-    // Mises à jour
-    let p = c.pages[6];
-    c.c_update = b.check(p, "Installer automatiquement les nouvelles versions publiées sur GitHub");
-    c.h_update_portable = b.hint(
-        p,
-        "Version portable : une nouvelle version est seulement annoncée dans le menu de l'icône (« Installer la \
-         version… ») ; rien n'est téléchargé ni remplacé sans ton accord. Décoché, l'appli ne contacte plus GitHub \
-         d'elle-même.",
-    );
-    c.h_update = b.hint(
-        p,
-        "Vérification au démarrage puis une fois par jour. Téléchargement depuis les releases GitHub du projet \
-         uniquement ; l'empreinte SHA-256 détecte un fichier corrompu (les releases ne sont pas signées).",
-    );
-    c.s_version = b.hint(p, "");
+    b.page = PAGE_ALBUMS;
+    c.e_filter = b.edit(p, 0, "Rechercher un album");
+    c.b_reload = b.owner(p, Kind::Secondary, "Recharger", "", Some(Icon::Refresh));
+    c.grid_albums = b.grid(p);
 
-    // Barre du bas
-    c.b_next = b.button(main, "Image &suivante");
-    c.msg = b.text(main, "");
-    c.b_save = b.add_id(main, "BUTTON", "&Enregistrer", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, ID_SAVE);
-    c.b_close = b.add_id(main, "BUTTON", "Fermer", BS_PUSHBUTTON | WS_TABSTOP, 0, ID_CLOSE);
+    b.page = PAGE_DISPLAY;
+    c.e_interval = b.edit(p, ES_NUMBER, "");
+    c.s_style = b.select(p, STYLES);
+    c.s_size = b.select(p, SIZES);
+    c.s_monitor = b.select(p, MONITORS);
+    c.e_offline = b.edit(p, ES_NUMBER, "");
+    c.t_split = b.toggle(
+        p,
+        "Écran très large (32:9)",
+        "Deux photos côte à côte au lieu d'une seule très rognée.",
+    );
+    c.t_landscape = b.toggle(p, "Uniquement les photos en paysage", "");
+    c.t_start = b.toggle(p, "Changer d'image au démarrage", "");
+    c.t_unlock = b.toggle(p, "Changer d'image à chaque déverrouillage du PC", "");
+    c.b_show_excluded = b.owner(p, Kind::Secondary, "Les réafficher", "", None);
 
-    // Onglets en dernier : sous les pages qui les recouvrent, et derniers dans l'ordre de tabulation.
-    c.tab = b.add(main, "SysTabControl32", "", WS_CLIPSIBLINGS | WS_TABSTOP, 0);
-    for (i, name) in PAGE_NAMES.iter().enumerate() {
-        let mut t = wide(name);
-        let it = TCITEMW {
-            mask: TCIF_TEXT,
-            pszText: PWSTR(t.as_mut_ptr()),
-            ..Default::default()
-        };
-        send_ptr(c.tab, TCM_INSERTITEMW, i, &it);
-    }
-    // Ordre de tabulation (et d'empilement) = ordre de création.
-    for (_, list) in &b.children {
-        for pair in list.windows(2) {
-            unsafe {
-                let _ = SetWindowPos(pair[1], Some(pair[0]), 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
-            }
-        }
-    }
+    b.page = PAGE_SCHEDULE;
+    c.e_from = b.edit(p, 0, "--:--");
+    c.e_to = b.edit(p, 0, "--:--");
+    c.t_battery = b.toggle(p, "Pause sur batterie", "");
+    c.t_metered = b.toggle(p, "Pause sur une connexion limitée", "Partage de connexion, forfait de données.");
+    c.t_fullscreen = b.toggle(p, "Pause pendant une application en plein écran", "Jeu, vidéo, présentation.");
+    c.t_preload = b.toggle(p, "Télécharger la photo suivante à l'avance", PRELOAD_HINT);
+
+    b.page = PAGE_RULES;
+    c.b_add_rule = b.owner(p, Kind::Secondary, "Ajouter une règle", "", Some(Icon::Plus));
+    c.b_del_rule = b.owner(p, Kind::Danger, "Supprimer", "", Some(Icon::Trash));
+    c.s_season = b.select(p, SEASONS);
+    c.e_rfrom = b.edit(p, 0, "--:--");
+    c.e_rto = b.edit(p, 0, "--:--");
+    c.grid_rule = b.grid(p);
+
+    b.page = PAGE_CAPTION;
+    c.t_place = b.toggle(p, "Afficher le lieu", "Ville, région, pays — photos géolocalisées.");
+    c.t_date = b.toggle(p, "Afficher le mois et l'année", "");
+    c.s_caption = b.select(p, CAPTIONS);
+    c.t_link = b.toggle(p, "Icône « Voir cette photo dans Immich » sur le bureau", LINK_HINT);
+    c.t_lock = b.toggle(p, "Appliquer aussi à l'écran de verrouillage", LOCK_HINT);
+
+    b.page = PAGE_UPDATES;
+    c.t_update = b.toggle(p, "Installer automatiquement les nouvelles versions", UPDATE_HINT);
+
+    // Barre du bas (hors des pages).
+    let id = b.id();
+    c.b_next = b.owner_id(main, id, Kind::Secondary, "Image suivante", "", Some(Icon::Next));
+    c.b_close = b.owner_id(main, ID_CLOSE, Kind::Secondary, "Fermer", "", None);
+    c.b_save = b.owner_id(main, ID_SAVE, Kind::Primary, "Enregistrer", "", None);
     c
 }
 
 // ---------- fenêtre ----------
 
+/// Élément dessiné sur la page (coordonnées de la zone de contenu, défilement compris).
+enum Draw {
+    Card(RECT),
+    Field(RECT, HWND),
+    Divider(RECT),
+    Text(RECT, String, Font, Tone, DRAW_TEXT_FORMAT),
+    Icon(RECT, Icon, Tone),
+}
+
+#[derive(Default)]
+struct Grid {
+    rows: Vec<AlbumRow>,
+    scroll: i32,
+    total: i32,
+    hot: Option<usize>,
+    focus: usize,
+}
+
+struct Geom {
+    cols: usize,
+    cell_w: i32,
+    cell_h: i32,
+    gap: i32,
+}
+
 #[derive(Default)]
 struct State {
     albums: Vec<AlbumInfo>, // albums chargés depuis Immich (triés)
     selected: Vec<String>,  // albums habituels cochés, dans l'ordre
-    rows: Vec<String>,      // identifiants affichés dans la liste des albums
     rules: Vec<AlbumRule>,
-    cur: Option<usize>,     // règle sélectionnée
-    rule_rows: Vec<String>, // identifiants affichés dans la liste des albums de la règle
+    cur: Option<usize>, // règle sélectionnée
+    rule_btns: Vec<HWND>,
     has_key: bool,
     cert_fp: String,
     http_warn: bool,
@@ -899,6 +1403,11 @@ struct State {
     last_status: String,
     page: usize,
     focus: isize, // contrôle à qui rendre le clavier quand la fenêtre est réactivée
+    scroll: i32,
+    total: i32,
+    test_msg: (String, Tone),
+    msg: (String, Tone),
+    cover_server: String, // serveur des vignettes affichées
 }
 
 /// Réponse d'une boîte de message (remplaçable par les tests).
@@ -907,17 +1416,25 @@ type Alert = Box<dyn FnMut(&str, MESSAGEBOX_STYLE) -> i32>;
 struct Win {
     settings: Arc<Settings>,
     hwnd: HWND,
+    hinst: HINSTANCE,
     c: Ctl,
-    ctls: Vec<HWND>,
-    font: Cell<HFONT>,
+    edits: Vec<HWND>,
+    pages: [Vec<HWND>; 7],
+    next_id: Cell<usize>,
+    fonts: RefCell<Fonts>,
     dpi: Cell<u32>,
-    icons: Cell<(HICON, HICON)>,
+    theme: Cell<Theme>,
+    field_brush: Cell<HBRUSH>,
+    icons: Cell<(HICON, HICON, HICON)>, // grande, petite, marque
     ready: Cell<bool>,
-    /// Remplissage d'une liste en cours : ses notifications sont ignorées.
+    in_layout: Cell<bool>,
+    /// Remplissage en cours : les notifications des zones de saisie sont ignorées.
     filling: Cell<bool>,
     portable: bool,
     st: RefCell<State>,
-    colors: RefCell<HashMap<isize, u32>>,
+    owners: RefCell<HashMap<isize, Owner>>,
+    grids: [RefCell<Grid>; 2],
+    draws: RefCell<Vec<Draw>>,
     alert: RefCell<Option<Alert>>,
 }
 
@@ -926,13 +1443,13 @@ fn register_classes(hinst: HINSTANCE) -> Result<(), String> {
     static ERR: Mutex<Option<String>> = Mutex::new(None);
     ONCE.call_once(|| unsafe {
         let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
-        for (class, bg) in [(CLASS_MAIN, COLOR_BTNFACE), (CLASS_PAGE, COLOR_WINDOW)] {
+        for class in [CLASS_MAIN, CLASS_CONTENT, CLASS_GRID] {
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(0x0008), // CS_DBLCLKS
                 lpfnWndProc: Some(wnd_proc),
                 hInstance: hinst,
                 hCursor: cursor,
-                hbrBackground: HBRUSH((bg.0 + 1) as isize as *mut _),
                 lpszClassName: class,
                 ..Default::default()
             };
@@ -949,7 +1466,7 @@ fn register_classes(hinst: HINSTANCE) -> Result<(), String> {
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if let Some(w) = current() {
-        if w.hwnd == hwnd || w.c.pages.contains(&hwnd) {
+        if w.hwnd == hwnd || w.c.content == hwnd || w.grid_of(hwnd).is_some() {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.handle(hwnd, msg, wp, lp))) {
                 Ok(Some(r)) => return r,
                 Ok(None) => {}
@@ -960,74 +1477,190 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     DefWindowProcW(hwnd, msg, wp, lp)
 }
 
-/// Place les contrôles d'une page de haut en bas.
+/// Place les éléments d'une page de haut en bas (cartes, lignes de réglage).
 struct Flow<'a> {
     w: &'a Win,
     x: i32,
     y: i32,
-    cw: i32, // en pixels
+    cw: i32,
+    draws: Vec<Draw>,
+    card: Option<(usize, i32)>,
+    rows: usize,
 }
 
 impl Flow<'_> {
-    fn px(&self, v: i32) -> i32 {
+    fn p(&self, v: i32) -> i32 {
         self.w.px(v)
     }
 
-    fn gap(&mut self, d: i32) {
-        self.y += self.px(d);
+    fn font(&self, f: Font) -> HFONT {
+        self.w.fonts.borrow().get(f)
     }
 
-    /// Libellé dans la colonne de gauche, contrôle à droite (largeur wd, 0 = jusqu'au bord).
-    fn row(&mut self, label: HWND, ctl: HWND, wd: i32) {
-        let cx = self.x + self.px(LABEL_W);
-        let mut cw = self.x + self.cw - cx;
-        if wd > 0 {
-            cw = cw.min(self.px(wd));
+    fn text(&mut self, r: RECT, s: &str, f: Font, t: Tone) {
+        self.draws.push(Draw::Text(r, s.to_string(), f, t, DT_WORDBREAK | DT_EDITCONTROL));
+    }
+
+    fn header(&mut self, title: &str, sub: &str) {
+        let th = text_h(self.font(Font::Title), title, self.cw);
+        self.text(rect(self.x, self.y, self.cw, th), title, Font::Title, Tone::Fg);
+        self.y += th + self.p(4);
+        if !sub.is_empty() {
+            let sh = text_h(self.font(Font::Body), sub, self.cw);
+            self.text(rect(self.x, self.y, self.cw, sh), sub, Font::Body, Tone::Muted);
+            self.y += sh;
         }
-        move_win(label, self.x, self.y, self.px(LABEL_W - 8), self.px(ROW_H));
-        move_win(ctl, cx, self.y, cw, self.px(ROW_H));
-        self.y += self.px(ROW_H);
+        self.y += self.p(22);
     }
 
-    /// Comme row ; la hauteur donnée à une liste déroulante est celle de sa liste ouverte.
-    fn combo(&mut self, label: HWND, ctl: HWND, wd: i32) {
-        let cx = self.x + self.px(LABEL_W);
-        move_win(label, self.x, self.y, self.px(LABEL_W - 8), self.px(ROW_H));
-        move_win(ctl, cx, self.y, self.px(wd).min(self.x + self.cw - cx), self.px(240));
-        self.y += self.px(ROW_H);
+    fn note(&mut self, s: &str, t: Tone) {
+        let h = text_h(self.font(Font::Small), s, self.cw - self.p(8));
+        self.text(rect(self.x + self.p(4), self.y, self.cw - self.p(8), h), s, Font::Small, t);
+        self.y += h + self.p(16);
     }
 
-    /// Zone numérique, ses flèches et un texte après.
-    fn number(&mut self, label: HWND, edit: HWND, updown: HWND, suffix: Option<HWND>) {
-        self.row(label, edit, 84);
-        send(updown, UDM_SETBUDDY, edit.0 as usize, 0); // replace les flèches contre la zone déplacée
-        if let Some(s) = suffix {
-            move_win(
-                s,
-                self.x + self.px(LABEL_W + 84 + 8),
-                self.y - self.px(ROW_H),
-                self.px(120),
-                self.px(ROW_H),
-            );
+    fn begin_card(&mut self) {
+        self.card = Some((self.draws.len(), self.y));
+        self.rows = 0;
+        self.y += self.p(6);
+    }
+
+    fn end_card(&mut self) {
+        if let Some((i, top)) = self.card.take() {
+            self.y += self.p(6);
+            self.draws.insert(i, Draw::Card(rect(self.x, top, self.cw, self.y - top)));
+            self.y += self.p(16);
         }
     }
 
-    /// Case à cocher décalée de dx (pixels à 100 %), sur une ou plusieurs lignes.
-    fn check(&mut self, h: HWND, dx: i32) {
-        let wd = self.cw - self.px(dx);
-        let ht = self
-            .px(CHECK_H)
-            .max(text_height(h, self.w.font.get(), wd - self.px(CHECK_GLYPH)) + self.px(3));
-        move_win(h, self.x + self.px(dx), self.y, wd, ht);
-        self.y += ht;
+    fn sep(&mut self) {
+        if self.rows > 0 {
+            let d = rect(self.x + self.p(20), self.y, self.cw - self.p(40), self.p(1).max(1));
+            self.draws.push(Draw::Divider(d));
+        }
+        self.rows += 1;
     }
 
-    /// Texte coupé à la largeur disponible, décalé de dx.
-    fn text(&mut self, h: HWND, dx: i32) {
-        let wd = self.cw - self.px(dx);
-        let ht = text_height(h, self.w.font.get(), wd);
-        move_win(h, self.x + self.px(dx), self.y, wd, ht);
-        self.y += ht;
+    fn inner(&self) -> (i32, i32) {
+        (self.x + self.p(20), self.cw - self.p(40))
+    }
+
+    /// Titre et description d'une ligne ; renvoie leur hauteur.
+    fn block_h(&self, title: &str, desc: &str, width: i32) -> i32 {
+        let mut h = text_h(self.font(Font::Semi), title, width);
+        if !desc.is_empty() {
+            h += self.p(3) + text_h(self.font(Font::Small), desc, width);
+        }
+        h
+    }
+
+    fn block(&mut self, x: i32, y: i32, width: i32, title: &str, desc: &str) {
+        let th = text_h(self.font(Font::Semi), title, width);
+        self.text(rect(x, y, width, th), title, Font::Semi, Tone::Fg);
+        if !desc.is_empty() {
+            let dh = text_h(self.font(Font::Small), desc, width);
+            self.text(rect(x, y + th + self.p(3), width, dh), desc, Font::Small, Tone::Muted);
+        }
+    }
+
+    /// Zone de saisie sous son libellé, sur toute la largeur de la carte.
+    fn field(&mut self, label: &str, edit: HWND, hint: &str, warn: &str) {
+        self.sep();
+        let (ix, iw) = self.inner();
+        self.y += self.p(16);
+        let lh = text_h(self.font(Font::Semi), label, iw);
+        self.text(rect(ix, self.y, iw, lh), label, Font::Semi, Tone::Fg);
+        self.y += lh + self.p(8);
+        let r = rect(ix, self.y, iw, self.p(FIELD_H));
+        self.place_field(r, edit, 0);
+        self.y += self.p(FIELD_H);
+        for (s, t) in [(warn, Tone::Err), (hint, Tone::Muted)] {
+            if !s.is_empty() {
+                self.y += self.p(8);
+                let h = text_h(self.font(Font::Small), s, iw);
+                self.text(rect(ix, self.y, iw, h), s, Font::Small, t);
+                self.y += h;
+            }
+        }
+        self.y += self.p(16);
+    }
+
+    /// Cadre arrondi d'une zone de saisie ; `left` : place réservée à une icône.
+    fn place_field(&mut self, r: RECT, edit: HWND, left: i32) {
+        self.draws.push(Draw::Field(r, edit));
+        let line = self.w.fonts.borrow().line;
+        let pad = self.p(12);
+        move_win(
+            edit,
+            r.left + pad + left,
+            r.top + (r.bottom - r.top - line) / 2,
+            r.right - r.left - 2 * pad - left,
+            line,
+        );
+    }
+
+    /// Ligne « interrupteur » : le bouton couvre toute la ligne (titre, description, interrupteur).
+    fn toggle(&mut self, t: HWND) {
+        self.sep();
+        let (title, desc) = self.w.owner_texts(t);
+        let width = self.cw - self.p(16) - 2 * self.p(14) - self.p(44) - self.p(16);
+        let h = (self.block_h(&title, &desc, width) + self.p(28)).max(self.p(56));
+        move_win(t, self.x + self.p(8), self.y + self.p(4), self.cw - self.p(16), h - self.p(8));
+        self.w.set_bg(t, Bg::Card);
+        self.y += h;
+    }
+
+    /// Ligne « titre à gauche, contrôles à droite » ; renvoie (haut, hauteur, x des contrôles).
+    fn row(&mut self, title: &str, desc: &str, right_w: i32) -> (i32, i32, i32) {
+        self.sep();
+        let (ix, iw) = self.inner();
+        let tw = iw - right_w - self.p(20);
+        let th = self.block_h(title, desc, tw);
+        let h = th.max(self.p(FIELD_H)) + self.p(28);
+        let top = self.y;
+        self.block(ix, top + (h - th) / 2, tw, title, desc);
+        self.y += h;
+        (top, h, ix + iw - right_w)
+    }
+
+    fn select_row(&mut self, title: &str, desc: &str, s: HWND) {
+        let wd = self.p(260);
+        let (top, h, x) = self.row(title, desc, wd);
+        move_win(s, x, top + (h - self.p(FIELD_H)) / 2, wd, self.p(FIELD_H));
+        self.w.set_bg(s, Bg::Card);
+    }
+
+    fn number_row(&mut self, title: &str, desc: &str, e: HWND, suffix: &str) {
+        let fw = self.p(96);
+        let sw = if suffix.is_empty() {
+            0
+        } else {
+            text_w(self.font(Font::Body), suffix) + self.p(10)
+        };
+        let (top, h, x) = self.row(title, desc, fw + sw);
+        let r = rect(x, top + (h - self.p(FIELD_H)) / 2, fw, self.p(FIELD_H));
+        self.place_field(r, e, 0);
+        if sw > 0 {
+            let sr = rect(r.right + self.p(10), r.top, sw, self.p(FIELD_H));
+            self.draws.push(Draw::Text(
+                sr,
+                suffix.to_string(),
+                Font::Body,
+                Tone::Muted,
+                DT_SINGLELINE | DT_VCENTER,
+            ));
+        }
+    }
+
+    /// Deux heures « de … à … ».
+    fn hours(&mut self, top: i32, h: i32, x: i32, from: HWND, to: HWND) {
+        let fw = self.p(88);
+        let y = top + (h - self.p(FIELD_H)) / 2;
+        self.place_field(rect(x, y, fw, self.p(FIELD_H)), from, 0);
+        let ar = rect(x + fw, y, self.p(32), self.p(FIELD_H));
+        let center = DT_SINGLELINE | DT_VCENTER | windows::Win32::Graphics::Gdi::DT_CENTER;
+        self.draws.push(Draw::Text(ar, "à".into(), Font::Body, Tone::Muted, center));
+        self.place_field(rect(x + fw + self.p(32), y, fw, self.p(FIELD_H)), to, 0);
     }
 }
 
@@ -1036,10 +1669,11 @@ impl Win {
         unsafe {
             let icc = INITCOMMONCONTROLSEX {
                 dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-                dwICC: ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_UPDOWN_CLASS | ICC_DATE_CLASSES,
+                dwICC: ICC_STANDARD_CLASSES,
             };
             let _ = InitCommonControlsEx(&icc);
         }
+        gdiplus();
         let hinst: HINSTANCE = unsafe { GetModuleHandleW(None) }.map_err(|e| e.to_string())?.into();
         register_classes(hinst)?;
         let hwnd = unsafe {
@@ -1060,50 +1694,56 @@ impl Win {
         }
         .map_err(|e| format!("CreateWindowEx : {e}"))?;
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-        let font = message_font(dpi);
+        let fonts = Fonts::new(dpi);
         let mut b = Builder {
             hinst,
-            font,
-            dpi,
+            font: fonts.body,
             next_id: 100,
-            ctls: vec![],
-            children: vec![],
-            colors: HashMap::new(),
+            owners: HashMap::new(),
+            edits: vec![],
+            pages: Default::default(),
+            page: 0,
         };
         let c = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&mut b, hwnd))) {
             Ok(c) => c,
             Err(p) => {
                 unsafe {
                     let _ = DestroyWindow(hwnd);
-                    let _ = DeleteObject(HGDIOBJ(font.0));
                 }
                 return Err(panic_message(&*p));
             }
         };
+        let theme = if system_dark() { DARK } else { LIGHT };
         let w = Rc::new(Win {
             settings,
             hwnd,
+            hinst,
             c,
-            ctls: b.ctls,
-            font: Cell::new(font),
+            edits: b.edits,
+            pages: b.pages,
+            next_id: Cell::new(b.next_id + 1000),
+            fonts: RefCell::new(fonts),
             dpi: Cell::new(dpi),
-            icons: Cell::new((HICON::default(), HICON::default())),
+            theme: Cell::new(theme),
+            field_brush: Cell::new(HBRUSH::default()),
+            icons: Cell::new(Default::default()),
             ready: Cell::new(false),
+            in_layout: Cell::new(false),
             filling: Cell::new(false),
             portable: is_portable(),
-            st: RefCell::new(State {
-                cur: None,
-                ..Default::default()
-            }),
-            colors: RefCell::new(b.colors),
+            st: RefCell::new(State::default()),
+            owners: RefCell::new(b.owners),
+            grids: Default::default(),
+            draws: RefCell::new(vec![]),
             alert: RefCell::new(None),
         });
         CURRENT.with(|cur| *cur.borrow_mut() = Some(w.clone()));
         OPEN_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+        w.apply_theme(theme);
         w.set_icons();
-        w.show_page(PAGE_SERVER);
         w.st.borrow_mut().focus = w.c.e_url.0 as isize;
         w.load();
+        w.show_page(PAGE_SERVER);
         w.ready.set(true);
         w.place_default();
         w.layout();
@@ -1114,17 +1754,64 @@ impl Win {
         mul_div(v, self.dpi.get(), 96)
     }
 
+    fn t(&self) -> Theme {
+        self.theme.get()
+    }
+
+    fn grid_of(&self, h: HWND) -> Option<usize> {
+        if h == self.c.grid_albums {
+            Some(GRID_ALBUMS)
+        } else if h == self.c.grid_rule {
+            Some(GRID_RULE)
+        } else {
+            None
+        }
+    }
+
+    fn grid_hwnd(&self, i: usize) -> HWND {
+        if i == GRID_ALBUMS {
+            self.c.grid_albums
+        } else {
+            self.c.grid_rule
+        }
+    }
+
+    fn apply_theme(&self, t: Theme) {
+        self.theme.set(t);
+        unsafe {
+            let old = self.field_brush.replace(CreateSolidBrush(colorref(t.field)));
+            if !old.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(old.0));
+            }
+            let on: i32 = t.dark as i32;
+            let _ = DwmSetWindowAttribute(self.hwnd, DWMWINDOWATTRIBUTE(20), &on as *const i32 as *const _, 4);
+            let scroll_theme = if t.dark { w!("DarkMode_Explorer") } else { w!("Explorer") };
+            for h in [self.c.content, self.c.grid_albums, self.c.grid_rule] {
+                let _ = SetWindowTheme(h, scroll_theme, PCWSTR::null());
+            }
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE | RDW_FRAME,
+            );
+        }
+    }
+
     fn set_icons(&self) {
         unsafe {
-            let big = crate::win::app::load_icon(GetSystemMetrics(SM_CXICON));
-            let small = crate::win::app::load_icon(GetSystemMetrics(SM_CXSMICON));
-            if let Some(i) = big {
-                send(self.hwnd, WM_SETICON, 1 /* ICON_BIG */, i.0 as isize);
+            let big = crate::win::app::load_icon(GetSystemMetrics(SM_CXICON)).unwrap_or_default();
+            let small = crate::win::app::load_icon(GetSystemMetrics(SM_CXSMICON)).unwrap_or_default();
+            let brand = crate::win::app::load_icon(self.px(32)).unwrap_or_default();
+            send(self.hwnd, WM_SETICON, 1 /* ICON_BIG */, big.0 as isize);
+            send(self.hwnd, WM_SETICON, 0 /* ICON_SMALL */, small.0 as isize);
+            for i in [self.icons.replace((big, small, brand))] {
+                for h in [i.0, i.1, i.2] {
+                    if !h.is_invalid() {
+                        let _ = DestroyIcon(h);
+                    }
+                }
             }
-            if let Some(i) = small {
-                send(self.hwnd, WM_SETICON, 0 /* ICON_SMALL */, i.0 as isize);
-            }
-            self.icons.set((big.unwrap_or_default(), small.unwrap_or_default()));
         }
     }
 
@@ -1180,278 +1867,1159 @@ impl Win {
     /// Libère les ressources une fois la fenêtre et ses contrôles détruits.
     fn release(&self) {
         unsafe {
-            let _ = DeleteObject(HGDIOBJ(self.font.get().0));
-            let (a, b) = self.icons.get();
-            for i in [a, b] {
+            let (a, b, c) = self.icons.get();
+            for i in [a, b, c] {
                 if !i.is_invalid() {
                     let _ = DestroyIcon(i);
                 }
             }
+            let _ = DeleteObject(HGDIOBJ(self.field_brush.get().0));
         }
         lock(&DONE).retain(|(h, _)| *h != self.hwnd.0 as isize);
         OPEN_HWND.store(0, Ordering::SeqCst);
         CURRENT.with(|c| *c.borrow_mut() = None);
     }
 
+    // ---------- contrôles dessinés ----------
+
+    fn owner_texts(&self, h: HWND) -> (String, String) {
+        self.owners
+            .borrow()
+            .get(&(h.0 as isize))
+            .map(|o| (o.text.clone(), o.desc.clone()))
+            .unwrap_or_default()
+    }
+
+    fn set_owner(&self, h: HWND, f: impl FnOnce(&mut Owner)) {
+        if let Some(o) = self.owners.borrow_mut().get_mut(&(h.0 as isize)) {
+            f(o);
+        }
+        invalidate(h);
+    }
+
+    fn set_bg(&self, h: HWND, bg: Bg) {
+        if let Some(o) = self.owners.borrow_mut().get_mut(&(h.0 as isize)) {
+            o.bg = bg;
+        }
+    }
+
+    fn on(&self, h: HWND) -> bool {
+        self.owners.borrow().get(&(h.0 as isize)).map(|o| o.on).unwrap_or(false)
+    }
+
+    fn set_on(&self, h: HWND, v: bool) {
+        self.set_owner(h, |o| o.on = v);
+    }
+
+    fn sel(&self, h: HWND) -> usize {
+        self.owners.borrow().get(&(h.0 as isize)).map(|o| o.sel).unwrap_or(0)
+    }
+
+    fn set_sel(&self, h: HWND, i: usize) {
+        self.set_owner(h, |o| o.sel = i);
+    }
+
+    fn sel_value(&self, h: HWND, list: &[Choice]) -> String {
+        choice_value(list, self.sel(h) as i32)
+    }
+
+    /// Dessine un bouton « owner-draw ».
+    fn draw_item(&self, d: &DRAWITEMSTRUCT) {
+        let Some(o) = self.owners.borrow().get(&(d.hwndItem.0 as isize)).cloned() else {
+            return;
+        };
+        let t = self.t();
+        let p = |v| self.px(v);
+        let state = d.itemState.0;
+        let hot = HOT.load(Ordering::SeqCst) == d.hwndItem.0 as isize;
+        let pressed = state & ODS_SELECTED != 0;
+        let disabled = state & ODS_DISABLED != 0;
+        let focus = state & ODS_FOCUS != 0 && state & ODS_NOFOCUSRECT == 0;
+        let r = d.rcItem;
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        let full = rect(0, 0, w, h);
+        let bg = match o.kind {
+            Kind::Nav(_) => t.bg,
+            _ => match o.bg {
+                Bg::Card => t.card,
+                Bg::Page => t.bg,
+            },
+        };
+        let buf = Buffer::new(d.hDC, r);
+        buf.fill(full, bg);
+        let fonts = self.fonts.borrow();
+        let st_page = self.st.borrow().page;
+        let cur = self.st.borrow().cur;
+        let mut texts: Vec<(RECT, String, HFONT, u32, DRAW_TEXT_FORMAT)> = vec![];
+        {
+            let cv = Canvas::new(buf.dc);
+            let radius = match o.kind {
+                Kind::Toggle | Kind::Rule(_) => p(12) as f32,
+                Kind::Select(_) => p(10) as f32,
+                _ => h as f32 / 2.0,
+            };
+            match o.kind {
+                Kind::Nav(i) => {
+                    let sel = st_page == i;
+                    let fill = if sel {
+                        Some(t.soft)
+                    } else if hot {
+                        Some(t.hover(bg))
+                    } else {
+                        None
+                    };
+                    if let Some(f) = fill {
+                        cv.fill_round(rf(full), radius, f);
+                    }
+                    let color = if sel { t.primary } else { t.fg };
+                    if let Some(ic) = o.icon {
+                        let s = p(20);
+                        cv.icon(
+                            ic,
+                            p(16) as f32,
+                            ((h - s) / 2) as f32,
+                            s as f32,
+                            if sel { t.primary } else { t.muted },
+                        );
+                    }
+                    let font = if sel { fonts.semi } else { fonts.nav };
+                    texts.push((
+                        rect(p(48), 0, w - p(56), h),
+                        o.text.clone(),
+                        font,
+                        color,
+                        DT_SINGLELINE | DT_VCENTER,
+                    ));
+                }
+                Kind::Primary | Kind::Secondary | Kind::Danger => {
+                    let (mut fill, mut fg) = match o.kind {
+                        Kind::Primary => (t.primary, t.on_primary),
+                        Kind::Danger => (t.secondary, t.err),
+                        _ => (t.secondary, t.fg),
+                    };
+                    if disabled {
+                        fill = mix(fill, bg, 0.5);
+                        fg = mix(fg, fill, 0.5);
+                    } else if pressed {
+                        fill = mix(fill, t.fg, 0.15);
+                    } else if hot {
+                        fill = if o.kind == Kind::Primary {
+                            mix(fill, t.bg, 0.12)
+                        } else {
+                            t.hover(fill)
+                        };
+                    }
+                    cv.fill_round(rf(full), radius, fill);
+                    let tw = text_w(fonts.semi, &o.text);
+                    let is = if o.icon.is_some() { p(18) } else { 0 };
+                    let gap = if is > 0 { p(8) } else { 0 };
+                    let x0 = (w - tw - is - gap) / 2;
+                    if let Some(ic) = o.icon {
+                        cv.icon(ic, x0 as f32, ((h - is) / 2) as f32, is as f32, fg);
+                    }
+                    texts.push((
+                        rect(x0 + is + gap, 0, tw + p(4), h),
+                        o.text.clone(),
+                        fonts.semi,
+                        fg,
+                        DT_SINGLELINE | DT_VCENTER,
+                    ));
+                }
+                Kind::Toggle => {
+                    if hot {
+                        cv.fill_round(rf(full), radius, t.hover(bg));
+                    }
+                    let (sw, sh) = (p(44), p(24));
+                    let sx = w - p(14) - sw;
+                    let sy = (h - sh) / 2;
+                    let track = if o.on { t.primary } else { t.track };
+                    cv.fill_round(rf(rect(sx, sy, sw, sh)), sh as f32 / 2.0, track);
+                    let kr = (sh - p(6)) as f32 / 2.0;
+                    let kx = if o.on {
+                        (sx + sw - p(3)) as f32 - kr
+                    } else {
+                        (sx + p(3)) as f32 + kr
+                    };
+                    let knob = if o.on {
+                        t.on_primary
+                    } else if t.dark {
+                        0xD4D4D8
+                    } else {
+                        0xFFFFFF
+                    };
+                    cv.fill_circle(kx, (sy + sh / 2) as f32, kr, argb(knob));
+                    let tw = sx - p(16) - p(14);
+                    let th = text_h(fonts.semi, &o.text, tw);
+                    let dh = if o.desc.is_empty() {
+                        0
+                    } else {
+                        p(3) + text_h(fonts.small, &o.desc, tw)
+                    };
+                    let y0 = (h - th - dh) / 2;
+                    texts.push((
+                        rect(p(14), y0, tw, th),
+                        o.text.clone(),
+                        fonts.semi,
+                        t.fg,
+                        DT_WORDBREAK | DT_EDITCONTROL,
+                    ));
+                    if dh > 0 {
+                        let dr = rect(p(14), y0 + th + p(3), tw, dh);
+                        texts.push((dr, o.desc.clone(), fonts.small, t.muted, DT_WORDBREAK | DT_EDITCONTROL));
+                    }
+                }
+                Kind::Select(list) => {
+                    cv.fill_round(rf(inset(full, 0)), radius, t.field);
+                    let border = if hot || pressed { mix(t.border, t.primary, 0.6) } else { t.border };
+                    cv.stroke_round(rf(inset(full, 1)), radius, argb(border), p(1).max(1) as f32);
+                    let is = p(18);
+                    cv.icon(Icon::Chevron, (w - p(12) - is) as f32, ((h - is) / 2) as f32, is as f32, t.muted);
+                    let label = list.get(o.sel).map(|c| c.1).unwrap_or("");
+                    let r = rect(p(14), 0, w - p(14) - is - p(16), h);
+                    texts.push((r, label.to_string(), fonts.body, t.fg, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS));
+                }
+                Kind::Rule(i) => {
+                    let sel = cur == Some(i);
+                    if sel {
+                        cv.fill_round(rf(full), radius, t.soft);
+                    } else if hot {
+                        cv.fill_round(rf(full), radius, t.hover(bg));
+                    }
+                    let rule = self.st.borrow().rules.get(i).cloned().unwrap_or_default();
+                    let title = rule_title(&rule).to_string();
+                    let detail = rule_detail(&rule);
+                    let tw = w - p(28);
+                    let th = text_h(fonts.semi, &title, tw);
+                    let dh = text_h(fonts.small, &detail, tw);
+                    let y0 = (h - th - dh - p(2)) / 2;
+                    let tc = if sel { t.primary } else { t.fg };
+                    texts.push((rect(p(14), y0, tw, th), title, fonts.semi, tc, DT_SINGLELINE | DT_END_ELLIPSIS));
+                    let dr = rect(p(14), y0 + th + p(2), tw, dh);
+                    texts.push((dr, detail, fonts.small, t.muted, DT_SINGLELINE | DT_END_ELLIPSIS));
+                }
+            }
+            if focus {
+                cv.stroke_round(rf(inset(full, 1)), (radius - 1.0).max(1.0), argb(t.primary), p(2) as f32);
+            }
+        }
+        for (r, s, f, c, fl) in texts {
+            draw_text(buf.dc, f, &s, r, c, fl);
+        }
+    }
+
+    /// Choix dans une liste déroulante : menu de Windows sous le contrôle.
+    fn open_select(&self, h: HWND) {
+        let Some(Kind::Select(list)) = self.owners.borrow().get(&(h.0 as isize)).map(|o| o.kind) else {
+            return;
+        };
+        let cur = self.sel(h);
+        let chosen = unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            for (i, (_, label)) in list.iter().enumerate() {
+                let t = wide(label);
+                let flags = if i == cur { MF_STRING | MF_CHECKED } else { MF_STRING };
+                let _ = AppendMenuW(menu, flags, i + 1, PCWSTR(t.as_ptr()));
+            }
+            let mut r = RECT::default();
+            let _ = GetWindowRect(h, &mut r);
+            let id = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+                r.left,
+                r.bottom + self.px(4),
+                None,
+                self.hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+            id.0 as usize
+        };
+        if chosen > 0 {
+            self.set_sel(h, chosen - 1);
+            self.select_changed(h);
+        }
+    }
+
+    fn select_changed(&self, h: HWND) {
+        if h == self.c.s_season {
+            let season = self.sel_value(h, SEASONS);
+            let changed = {
+                let mut st = self.st.borrow_mut();
+                match st.cur {
+                    Some(i) if i < st.rules.len() => {
+                        st.rules[i].season = season;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if changed {
+                self.refresh_rule_buttons();
+            }
+        }
+    }
+
     // ---------- mise en page ----------
+
+    /// Rectangles de la fenêtre principale : barre latérale, contenu, barre du bas.
+    fn frame(&self) -> (RECT, RECT, RECT) {
+        let rc = client_rect(self.hwnd);
+        let s = self.px(SIDEBAR_W).min(rc.right);
+        let f = self.px(FOOTER_H);
+        (
+            rect(0, 0, s, rc.bottom),
+            rect(s, 0, rc.right - s, rc.bottom - f),
+            rect(s, rc.bottom - f, rc.right - s, f),
+        )
+    }
+
+    fn footer_buttons(&self) -> (RECT, RECT, RECT) {
+        let (_, _, f) = self.frame();
+        let p = |v| self.px(v);
+        let y = f.top + (f.bottom - f.top - p(BTN_H)) / 2;
+        let save = rect(f.right - p(24) - p(136), y, p(136), p(BTN_H));
+        let close = rect(save.left - p(10) - p(112), y, p(112), p(BTN_H));
+        let next = rect(f.left + p(24), y, p(176), p(BTN_H));
+        (next, close, save)
+    }
 
     fn layout(&self) {
         if !self.ready.get() {
             return;
         }
+        let (side, content, _) = self.frame();
+        let p = |v| self.px(v);
+        for (i, h) in self.c.nav.iter().enumerate() {
+            move_win(*h, p(12), p(96) + i as i32 * p(46), side.right - p(24), p(42));
+        }
+        let (next, close, save) = self.footer_buttons();
+        move_rect(self.c.b_next, next);
+        move_rect(self.c.b_close, close);
+        move_rect(self.c.b_save, save);
+        move_rect(self.c.content, content);
+        invalidate(self.hwnd);
+        self.layout_content();
+    }
+
+    /// Place les contrôles de la page affichée et prépare ce qu'elle dessine.
+    fn layout_content(&self) {
+        if !self.ready.get() || self.in_layout.replace(true) {
+            return;
+        }
+        // Deux passes au plus : l'apparition de la barre de défilement réduit la largeur.
+        for _ in 0..2 {
+            let rc = client_rect(self.c.content);
+            let page = self.st.borrow().page;
+            let total = self.layout_page(page, rc);
+            let scroll = {
+                let mut st = self.st.borrow_mut();
+                st.total = total;
+                st.scroll = st.scroll.clamp(0, (total - rc.bottom).max(0));
+                st.scroll
+            };
+            let si = SCROLLINFO {
+                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                nMin: 0,
+                nMax: (total - 1).max(0),
+                nPage: rc.bottom.max(0) as u32,
+                nPos: scroll,
+                nTrackPos: 0,
+            };
+            unsafe {
+                SetScrollInfo(self.c.content, SB_VERT, &si, true);
+            }
+            if client_rect(self.c.content).right == rc.right {
+                break;
+            }
+        }
+        // Le défilement a pu être réduit : on replace avec la bonne position.
+        let rc = client_rect(self.c.content);
+        let page = self.st.borrow().page;
+        self.layout_page(page, rc);
+        self.in_layout.set(false);
+        unsafe {
+            let _ = RedrawWindow(Some(self.c.content), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
+    }
+
+    /// Page `page` dans la zone `rc` ; renvoie la hauteur totale de son contenu.
+    fn layout_page(&self, page: usize, rc: RECT) -> i32 {
+        let p = |v| self.px(v);
         let c = &self.c;
-        let p = |v| self.px(v);
-        let rc = client_rect(self.hwnd);
-        let (width, height) = (rc.right, rc.bottom);
-        let m = p(MARGIN);
-        move_win(c.status, m, p(8), width - 2 * m, p(22));
-
-        let by = height - m - p(BTN_H);
-        let (close_w, save_w, next_w) = (p(96), p(112), p(128));
-        move_win(c.b_close, width - m - close_w, by, close_w, p(BTN_H));
-        move_win(c.b_save, width - m - close_w - p(8) - save_w, by, save_w, p(BTN_H));
-        move_win(c.b_next, m, by, next_w, p(BTN_H));
-        self.place_msg();
-
-        let ty = p(34);
-        let (tw, th) = (width - 2 * m, by - p(12) - ty);
-        move_win(c.tab, m, ty, tw, th);
-        let mut r = RECT {
-            left: 0,
-            top: 0,
-            right: tw,
-            bottom: th,
-        };
-        send(c.tab, TCM_ADJUSTRECT, 0, &mut r as *mut RECT as isize);
-        let (pw, ph) = (r.right - r.left, r.bottom - r.top);
-        for pg in c.pages {
-            move_win(pg, m + r.left, ty + r.top, pw, ph);
-        }
-        let pad = p(PAGE_PAD);
-        let bottom = ph - pad;
-        let flow = || Flow {
+        let scroll = self.st.borrow().scroll;
+        let full_w = rc.right - 2 * p(PAD);
+        let mut f = Flow {
             w: self,
-            x: pad,
-            y: pad - p(2),
-            cw: pw - 2 * pad,
+            x: p(PAD),
+            y: p(28) - scroll,
+            cw: full_w.min(p(FORM_W)),
+            draws: vec![],
+            card: None,
+            rows: 0,
         };
-        let (http_warn, excluded) = {
+        let (http_warn, excluded, n_selected, test_msg, has_rule, n_rules) = {
             let st = self.st.borrow();
-            (st.http_warn, st.excluded)
+            (
+                st.http_warn,
+                st.excluded,
+                st.selected.len(),
+                st.test_msg.clone(),
+                st.cur.is_some(),
+                st.rules.len(),
+            )
         };
-
-        // Serveur
-        let mut f = flow();
-        f.row(c.l_url, c.e_url, 0);
-        show_win(c.w_http, http_warn);
-        if http_warn {
-            f.gap(4);
-            f.text(c.w_http, LABEL_W);
+        let mut fixed = false; // page à la hauteur de la fenêtre (grille d'albums)
+        match page {
+            PAGE_SERVER => {
+                f.header("Serveur", "Connexion à ton serveur Immich.");
+                f.begin_card();
+                f.field("URL du serveur", c.e_url, "", if http_warn { HTTP_WARN } else { "" });
+                f.field("Token (clé API)", c.e_key, KEY_HINT, "");
+                f.end_card();
+                f.begin_card();
+                f.toggle(c.t_insecure);
+                f.end_card();
+                let bw = p(214);
+                move_win(c.b_test, f.x, f.y, bw, p(BTN_H));
+                self.set_bg(c.b_test, Bg::Page);
+                if !test_msg.0.is_empty() {
+                    let tw = f.cw - bw - p(16);
+                    let th = text_h(self.fonts.borrow().body, &test_msg.0, tw);
+                    let y = f.y + (p(BTN_H) - th).max(0) / 2;
+                    f.text(rect(f.x + bw + p(16), y, tw, th), &test_msg.0, Font::Body, test_msg.1);
+                    f.y += th.max(p(BTN_H));
+                } else {
+                    f.y += p(BTN_H);
+                }
+            }
+            PAGE_ALBUMS => {
+                fixed = true;
+                f.cw = full_w;
+                f.header(
+                    "Albums",
+                    &format!("{} — les photos sont tirées au hasard dans ces albums.", count_label(n_selected)),
+                );
+                let fw = p(320).min(f.cw / 2);
+                let field = rect(f.x, f.y, fw, p(FIELD_H));
+                f.place_field(field, c.e_filter, p(26));
+                f.draws.push(Draw::Icon(
+                    rect(field.left + p(12), field.top + (p(FIELD_H) - p(18)) / 2, p(18), p(18)),
+                    Icon::Search,
+                    Tone::Muted,
+                ));
+                let bw = p(150);
+                move_win(c.b_reload, f.x + f.cw - bw, f.y + (p(FIELD_H) - p(BTN_H)) / 2, bw, p(BTN_H));
+                self.set_bg(c.b_reload, Bg::Page);
+                if !test_msg.0.is_empty() {
+                    let mr = rect(field.right + p(16), f.y, f.cw - fw - bw - p(32), p(FIELD_H));
+                    let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
+                    f.draws.push(Draw::Text(mr, test_msg.0.clone(), Font::Body, test_msg.1, flags));
+                }
+                f.y += p(FIELD_H) + p(20);
+                let gh = (rc.bottom - f.y - p(20)).max(p(160));
+                move_win(c.grid_albums, f.x, f.y, f.cw, gh);
+                f.y += gh;
+            }
+            PAGE_DISPLAY => {
+                f.header("Affichage", "Fréquence, cadrage et qualité des photos.");
+                f.begin_card();
+                f.number_row("Changer d'image toutes les", "", c.e_interval, "minutes");
+                f.select_row("Ajustement", "Comment la photo remplit l'écran.", c.s_style);
+                f.select_row(
+                    "Qualité",
+                    "Pleine résolution : JPEG généré par Immich (HEIC et RAW compris).",
+                    c.s_size,
+                );
+                f.select_row("Plusieurs écrans", "", c.s_monitor);
+                f.number_row("Photos gardées hors ligne", OFFLINE_HINT, c.e_offline, "");
+                f.end_card();
+                f.begin_card();
+                for t in [c.t_split, c.t_landscape, c.t_start, c.t_unlock] {
+                    f.toggle(t);
+                }
+                f.end_card();
+                show_win(c.b_show_excluded, excluded > 0);
+                if excluded > 0 {
+                    f.begin_card();
+                    let bw = p(150);
+                    let (top, h, x) = f.row(
+                        &format!("{excluded} photo(s) masquée(s)"),
+                        "Depuis le menu « Ne plus afficher cette photo ».",
+                        bw,
+                    );
+                    move_win(c.b_show_excluded, x, top + (h - p(BTN_H)) / 2, bw, p(BTN_H));
+                    self.set_bg(c.b_show_excluded, Bg::Card);
+                    f.end_card();
+                }
+            }
+            PAGE_SCHEDULE => {
+                f.header("Planification", "Quand l'image change toute seule.");
+                f.begin_card();
+                let (top, h, x) = f.row("Plage horaire", HOURS_HINT, p(88) * 2 + p(32));
+                f.hours(top, h, x, c.e_from, c.e_to);
+                f.end_card();
+                f.begin_card();
+                for t in [c.t_battery, c.t_metered, c.t_fullscreen] {
+                    f.toggle(t);
+                }
+                f.end_card();
+                f.y -= p(8);
+                f.note(PAUSES_HINT, Tone::Muted);
+                f.begin_card();
+                f.toggle(c.t_preload);
+                f.end_card();
+            }
+            PAGE_RULES => {
+                fixed = true;
+                f.cw = full_w;
+                f.header("Saisons et heures", RULES_HINT);
+                let top = f.y;
+                let bottom = (rc.bottom - p(24)).max(top + p(300));
+                // Liste des règles.
+                let lw = p(RULES_W);
+                let list = rect(f.x, top, lw, bottom - top);
+                f.draws.push(Draw::Card(list));
+                let btns = self.st.borrow().rule_btns.clone();
+                let mut y = top + p(10);
+                for b in &btns {
+                    move_win(*b, list.left + p(8), y, lw - p(16), p(58));
+                    self.set_bg(*b, Bg::Card);
+                    y += p(62);
+                }
+                if n_rules == 0 {
+                    let r = rect(list.left + p(20), y + p(6), lw - p(40), p(60));
+                    f.text(r, "Aucune règle pour l'instant.", Font::Small, Tone::Muted);
+                }
+                move_win(
+                    c.b_add_rule,
+                    list.left + p(12),
+                    list.bottom - p(12) - p(BTN_H),
+                    lw - p(24),
+                    p(BTN_H),
+                );
+                self.set_bg(c.b_add_rule, Bg::Card);
+                // Règle sélectionnée.
+                let ex = list.right + p(16);
+                let ed = rect(ex, top, f.x + f.cw - ex, bottom - top);
+                f.draws.push(Draw::Card(ed));
+                for h in [c.b_del_rule, c.s_season, c.e_rfrom, c.e_rto, c.grid_rule] {
+                    show_win(h, has_rule && page == PAGE_RULES);
+                }
+                let (ix, iw) = (ed.left + p(20), ed.right - ed.left - p(40));
+                if has_rule {
+                    let mut y = ed.top + p(18);
+                    let semi = self.fonts.borrow().semi;
+                    let lab = |f: &mut Flow, y: i32, s: &str| {
+                        let r = rect(ix, y, p(90), p(FIELD_H));
+                        f.draws
+                            .push(Draw::Text(r, s.to_string(), Font::Semi, Tone::Fg, DT_SINGLELINE | DT_VCENTER));
+                    };
+                    // En-tête : règle sélectionnée et suppression.
+                    let bw = p(140);
+                    move_win(c.b_del_rule, ed.right - p(20) - bw, y, bw, p(BTN_H));
+                    self.set_bg(c.b_del_rule, Bg::Card);
+                    let title = self
+                        .st
+                        .borrow()
+                        .cur
+                        .and_then(|i| self.st.borrow().rules.get(i).map(|r| rule_title(r).to_string()));
+                    let hr = rect(ix, y, iw - bw - p(16), p(BTN_H));
+                    let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
+                    f.draws.push(Draw::Text(
+                        hr,
+                        format!("Règle : {}", title.unwrap_or_default()),
+                        Font::Semi,
+                        Tone::Muted,
+                        flags,
+                    ));
+                    y += p(BTN_H) + p(14);
+                    lab(&mut f, y, "Saison");
+                    move_win(c.s_season, ix + p(100), y, p(260).min(iw - p(100)), p(FIELD_H));
+                    self.set_bg(c.s_season, Bg::Card);
+                    y += p(FIELD_H) + p(12);
+                    lab(&mut f, y, "Heures");
+                    f.hours(y, p(FIELD_H), ix + p(100), c.e_rfrom, c.e_rto);
+                    y += p(FIELD_H) + p(20);
+                    let lh = text_h(semi, "Albums", iw);
+                    f.text(rect(ix, y, iw, lh), "Albums de cette règle", Font::Semi, Tone::Fg);
+                    y += lh + p(10);
+                    move_win(c.grid_rule, ix, y, iw, (ed.bottom - p(16) - y).max(p(120)));
+                } else {
+                    let msg = if n_rules == 0 {
+                        "Ajoute une règle pour utiliser d'autres albums selon la saison ou l'heure."
+                    } else {
+                        "Choisis une règle à gauche."
+                    };
+                    let mh = text_h(self.fonts.borrow().body, msg, iw);
+                    let r = rect(ix, ed.top + (ed.bottom - ed.top - mh) / 2, iw, mh);
+                    f.draws.push(Draw::Text(
+                        r,
+                        msg.into(),
+                        Font::Body,
+                        Tone::Muted,
+                        DT_WORDBREAK | windows::Win32::Graphics::Gdi::DT_CENTER,
+                    ));
+                }
+                f.y = bottom;
+            }
+            PAGE_CAPTION => {
+                f.header("Légende", "Lieu et date incrustés sur la photo, dans une carte façon verre dépoli.");
+                f.begin_card();
+                f.toggle(c.t_place);
+                f.toggle(c.t_date);
+                f.select_row("Position du texte", "", c.s_caption);
+                f.end_card();
+                f.begin_card();
+                f.toggle(c.t_link);
+                f.end_card();
+                f.begin_card();
+                f.toggle(c.t_lock);
+                f.end_card();
+            }
+            _ => {
+                let version = if self.portable {
+                    format!("Version {VERSION} (portable)")
+                } else {
+                    format!("Version {VERSION}")
+                };
+                f.header("Mises à jour", &version);
+                f.begin_card();
+                f.toggle(c.t_update);
+                f.end_card();
+            }
         }
-        f.gap(10);
-        f.row(c.l_key, c.e_key, 0);
-        f.gap(4);
-        f.text(c.h_key, LABEL_W);
-        f.gap(12);
-        f.check(c.c_insecure, LABEL_W);
-        f.gap(2);
-        f.text(c.h_pin, LABEL_W + CHECK_GLYPH);
-        f.gap(16);
-        move_win(c.b_test, f.x + p(LABEL_W), f.y, p(230).min(f.cw - p(LABEL_W)), p(BTN_H));
-        f.y += p(BTN_H);
-        f.gap(8);
-        f.text(c.test_msg, LABEL_W);
-
-        // Albums
-        let f = flow();
-        let fw = p(240).min(f.cw / 2);
-        let bw = p(150);
-        move_win(c.e_filter, f.x, f.y + (p(BTN_H) - p(ROW_H)) / 2, fw, p(ROW_H));
-        move_win(c.b_reload, f.x + f.cw - bw, f.y, bw, p(BTN_H));
-        move_win(c.albums_msg, f.x + fw + p(12), f.y, f.cw - fw - bw - p(24), p(BTN_H));
-        let y = f.y + p(BTN_H) + p(8);
-        let count_h = p(22);
-        let lv_h = (bottom - y - count_h - p(4)).max(p(60));
-        move_win(c.lv_albums, f.x, y, f.cw, lv_h);
-        self.size_columns(c.lv_albums, p(100));
-        move_win(c.album_count, f.x, y + lv_h + p(4), f.cw, count_h);
-
-        // Affichage
-        let mut f = flow();
-        f.number(c.l_interval, c.e_interval, c.ud_interval, Some(c.s_minutes));
-        f.gap(10);
-        f.combo(c.l_style, c.cb_style, 280);
-        f.gap(8);
-        f.combo(c.l_size, c.cb_size, 280);
-        f.gap(8);
-        f.combo(c.l_monitor, c.cb_monitor, 280);
-        f.gap(10);
-        f.number(c.l_offline, c.e_offline, c.ud_offline, None);
-        f.gap(4);
-        f.text(c.h_offline, LABEL_W);
-        f.gap(14);
-        for h in [c.c_split, c.c_landscape, c.c_start, c.c_unlock] {
-            f.check(h, 0);
-            f.gap(4);
+        *self.draws.borrow_mut() = f.draws;
+        if fixed {
+            rc.bottom
+        } else {
+            f.y + scroll + p(PAD)
         }
-        show_win(c.excluded_info, excluded > 0);
-        show_win(c.b_show_excluded, excluded > 0);
-        if excluded > 0 {
-            f.gap(10);
-            let ebw = p(130);
-            let ew = f.cw - ebw - p(12);
-            let eh = text_height(c.excluded_info, self.font.get(), ew);
-            move_win(c.excluded_info, f.x, f.y + (p(BTN_H) - eh).max(0) / 2, ew, eh);
-            move_win(c.b_show_excluded, f.x + f.cw - ebw, f.y, ebw, p(BTN_H));
-        }
-
-        // Planification
-        let mut f = flow();
-        let cw = p(CLOCK_W);
-        let lx = f.x + p(LABEL_W);
-        move_win(c.l_hours, f.x, f.y, p(LABEL_W - 8), p(ROW_H));
-        move_win(c.dt_from, lx, f.y, cw, p(ROW_H));
-        move_win(c.s_to, lx + cw + p(10), f.y, p(20), p(ROW_H));
-        move_win(c.dt_to, lx + cw + p(34), f.y, cw, p(ROW_H));
-        f.y += p(ROW_H);
-        f.gap(4);
-        f.text(c.h_hours, LABEL_W);
-        f.gap(16);
-        for h in [c.c_battery, c.c_metered, c.c_fullscreen] {
-            f.check(h, 0);
-            f.gap(4);
-        }
-        f.text(c.h_pauses, CHECK_GLYPH);
-        f.gap(16);
-        f.check(c.c_preload, 0);
-        f.gap(2);
-        f.text(c.h_preload, CHECK_GLYPH);
-
-        // Saisons et heures
-        let mut f = flow();
-        f.text(c.h_rules, 0);
-        f.gap(12);
-        let top = f.y;
-        let lw = p(230).min(f.cw * 2 / 5);
-        let lb_h = (bottom - top - p(BTN_H) - p(8)).max(p(60));
-        move_win(c.lb_rules, f.x, top, lw, lb_h);
-        let half = (lw - p(8)) / 2;
-        move_win(c.b_add_rule, f.x, top + lb_h + p(8), half, p(BTN_H));
-        move_win(c.b_del_rule, f.x + half + p(8), top + lb_h + p(8), lw - half - p(8), p(BTN_H));
-        let rx = f.x + lw + p(16);
-        let rw = f.x + f.cw - rx;
-        let lw2 = p(64);
-        let mut y = top;
-        move_win(c.l_season, rx, y, lw2, p(ROW_H));
-        move_win(c.cb_season, rx + lw2, y, p(220).min(rw - lw2), p(240));
-        y += p(ROW_H) + p(8);
-        move_win(c.l_rhours, rx, y, lw2, p(ROW_H));
-        move_win(c.dt_rfrom, rx + lw2, y, cw, p(ROW_H));
-        move_win(c.s_rto, rx + lw2 + cw + p(10), y, p(20), p(ROW_H));
-        move_win(c.dt_rto, rx + lw2 + cw + p(34), y, cw, p(ROW_H));
-        y += p(ROW_H) + p(12);
-        move_win(c.l_ralbums, rx, y, rw, p(20));
-        y += p(22);
-        move_win(c.lv_rule, rx, y, rw, (bottom - y).max(p(60)));
-        self.size_columns(c.lv_rule, 0);
-
-        // Légende
-        let mut f = flow();
-        f.check(c.c_place, 0);
-        f.gap(4);
-        f.check(c.c_date, 0);
-        f.gap(12);
-        f.combo(c.l_caption, c.cb_caption, 220);
-        f.gap(18);
-        f.check(c.c_link, 0);
-        f.gap(2);
-        f.text(c.h_link, CHECK_GLYPH);
-        f.gap(18);
-        f.check(c.c_lock, 0);
-        f.gap(2);
-        f.text(c.h_lock, CHECK_GLYPH);
-
-        // Mises à jour
-        let mut f = flow();
-        f.check(c.c_update, 0);
-        f.gap(2);
-        show_win(c.h_update_portable, self.portable);
-        if self.portable {
-            f.text(c.h_update_portable, CHECK_GLYPH);
-            f.gap(8);
-        }
-        f.text(c.h_update, CHECK_GLYPH);
-        f.gap(20);
-        f.text(c.s_version, 0);
-    }
-
-    /// Message de la barre du bas, centré sur la hauteur des boutons.
-    fn place_msg(&self) {
-        let p = |v| self.px(v);
-        let rc = client_rect(self.hwnd);
-        let m = p(MARGIN);
-        let by = rc.bottom - m - p(BTN_H);
-        let x = m + p(128) + p(12);
-        let wd = rc.right - m - p(96) - p(8) - p(112) - p(12) - x;
-        let ht = text_height(self.c.msg, self.font.get(), wd).min(p(BTN_H) + m);
-        move_win(self.c.msg, x, by + (p(BTN_H) - ht) / 2, wd, ht);
-    }
-
-    /// La première colonne prend la place laissée par les autres (largeur `other`), barre de
-    /// défilement comprise : jamais de défilement horizontal.
-    fn size_columns(&self, lv: HWND, other: i32) {
-        let cw = client_rect(lv).right;
-        if other > 0 {
-            send(lv, LVM_SETCOLUMNWIDTH, 1, other as isize);
-        }
-        send(lv, LVM_SETCOLUMNWIDTH, 0, (cw - other - self.px(20)).max(self.px(80)) as isize);
     }
 
     fn show_page(&self, i: usize) {
-        self.st.borrow_mut().page = i;
-        send(self.c.tab, TCM_SETCURSEL, i, 0);
-        for (j, pg) in self.c.pages.iter().enumerate() {
-            if j == i {
-                unsafe {
-                    let _ = SetWindowPos(*pg, None, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
-                }
+        let old = {
+            let mut st = self.st.borrow_mut();
+            let old = st.page;
+            st.page = i;
+            if old != i {
+                st.scroll = 0;
             }
-            show_win(*pg, j == i);
+            old
+        };
+        let rule_btns = self.st.borrow().rule_btns.clone();
+        for (j, list) in self.pages.iter().enumerate() {
+            for h in list {
+                show_win(*h, j == i);
+            }
         }
+        for b in rule_btns {
+            show_win(b, i == PAGE_RULES);
+        }
+        invalidate(self.c.nav[old]);
+        invalidate(self.c.nav[i]);
         // Le clavier ne doit pas rester sur un contrôle désormais caché.
         unsafe {
             let f = GetFocus();
-            if !f.is_invalid() && self.c.pages.iter().enumerate().any(|(j, pg)| j != i && IsChild(*pg, f).as_bool()) {
-                let _ = SetFocus(Some(self.c.tab));
+            if !f.is_invalid() && IsChild(self.c.content, f).as_bool() && !IsWindowVisible(f).as_bool() {
+                let _ = SetFocus(Some(self.c.nav[i]));
             }
+        }
+        self.layout_content();
+    }
+
+    /// Fait défiler la page pour montrer le contrôle qui reçoit le focus.
+    fn ensure_visible(&self, h: HWND) {
+        unsafe {
+            if !IsChild(self.c.content, h).as_bool() || self.grid_of(h).is_some() {
+                return;
+            }
+            let mut r = RECT::default();
+            let _ = GetWindowRect(h, &mut r);
+            let mut pt = POINT { x: r.left, y: r.top };
+            let _ = ScreenToClient(self.c.content, &mut pt);
+            let hgt = r.bottom - r.top;
+            let view = client_rect(self.c.content).bottom;
+            let m = self.px(16);
+            let delta = if pt.y < m {
+                pt.y - m
+            } else if pt.y + hgt > view - m {
+                pt.y + hgt - view + m
+            } else {
+                0
+            };
+            if delta != 0 {
+                let cur = self.st.borrow().scroll;
+                self.scroll_to(cur + delta);
+            }
+        }
+    }
+
+    fn scroll_to(&self, y: i32) {
+        let changed = {
+            let mut st = self.st.borrow_mut();
+            let max = (st.total - client_rect(self.c.content).bottom).max(0);
+            let y = y.clamp(0, max);
+            let changed = y != st.scroll;
+            st.scroll = y;
+            changed
+        };
+        if changed {
+            self.layout_content();
+        }
+    }
+
+    // ---------- peinture ----------
+
+    fn paint_main(&self, dc: HDC) {
+        let t = self.t();
+        let p = |v| self.px(v);
+        let rc = client_rect(self.hwnd);
+        let (side, _, foot) = self.frame();
+        let buf = Buffer::new(dc, rc);
+        buf.fill(rc, t.bg);
+        buf.fill(rect(side.right - p(1).max(1), 0, p(1).max(1), rc.bottom), t.divider);
+        buf.fill(rect(foot.left, foot.top, foot.right - foot.left, p(1).max(1)), t.divider);
+        let fonts = self.fonts.borrow();
+        // Marque.
+        let brand = self.icons.get().2;
+        if !brand.is_invalid() {
+            unsafe {
+                let _ = DrawIconEx(buf.dc, p(22), p(26), brand, p(32), p(32), 0, None, DI_NORMAL);
+            }
+        }
+        draw_text(
+            buf.dc,
+            fonts.brand,
+            "Immich Wallpaper",
+            rect(p(64), p(24), side.right - p(72), p(22)),
+            t.fg,
+            DT_SINGLELINE,
+        );
+        let ver = if self.portable {
+            format!("{VERSION} · portable")
+        } else {
+            VERSION.to_string()
+        };
+        draw_text(
+            buf.dc,
+            fonts.small,
+            &ver,
+            rect(p(64), p(46), side.right - p(72), p(18)),
+            t.muted,
+            DT_SINGLELINE,
+        );
+        // État de l'appli, en bas de la barre latérale.
+        let status = self.st.borrow().last_status.clone();
+        if !status.is_empty() {
+            let wd = side.right - p(44);
+            let h = text_h(fonts.small, &status, wd).min(p(80));
+            let y = rc.bottom - p(22) - h;
+            {
+                let cv = Canvas::new(buf.dc);
+                cv.fill_circle(p(26) as f32, (y + p(8)) as f32, p(3) as f32, argb(t.primary));
+            }
+            draw_text(
+                buf.dc,
+                fonts.small,
+                &status,
+                rect(p(36), y, wd - p(4), h),
+                t.muted,
+                DT_WORDBREAK | DT_EDITCONTROL,
+            );
+        }
+        // Message de la barre du bas.
+        let (msg, tone) = self.st.borrow().msg.clone();
+        if !msg.is_empty() {
+            let (next, close, _) = self.footer_buttons();
+            let r = rect(
+                next.right + p(16),
+                foot.top,
+                close.left - p(16) - next.right - p(16),
+                foot.bottom - foot.top,
+            );
+            let h = text_h(fonts.body, &msg, r.right - r.left).min(r.bottom - r.top);
+            let r2 = rect(r.left, r.top + (r.bottom - r.top - h) / 2, r.right - r.left, h);
+            draw_text(
+                buf.dc,
+                fonts.body,
+                &msg,
+                r2,
+                t.tone(tone),
+                DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS,
+            );
+        }
+    }
+
+    fn paint_content(&self, dc: HDC) {
+        let t = self.t();
+        let rc = client_rect(self.c.content);
+        let buf = Buffer::new(dc, rc);
+        buf.fill(rc, t.bg);
+        let focus = unsafe { GetFocus() };
+        let draws = self.draws.borrow();
+        let p = |v| self.px(v);
+        {
+            let cv = Canvas::new(buf.dc);
+            for d in draws.iter() {
+                match d {
+                    Draw::Card(r) => cv.fill_round(rf(*r), p(18) as f32, t.card),
+                    Draw::Field(r, e) => {
+                        let rr = rf(*r);
+                        cv.fill_round(rr, p(10) as f32, t.field);
+                        let (color, wd) = if *e == focus { (t.primary, p(2)) } else { (t.border, p(1).max(1)) };
+                        let half = wd as f32 / 2.0;
+                        let br = Rf {
+                            x: rr.x + half,
+                            y: rr.y + half,
+                            w: rr.w - wd as f32,
+                            h: rr.h - wd as f32,
+                        };
+                        cv.stroke_round(br, p(10) as f32 - half, argb(color), wd as f32);
+                    }
+                    Draw::Divider(r) => buf.fill(*r, t.divider),
+                    Draw::Icon(r, ic, tone) => cv.icon(*ic, r.left as f32, r.top as f32, (r.right - r.left) as f32, t.tone(*tone)),
+                    Draw::Text(..) => {}
+                }
+            }
+        }
+        let fonts = self.fonts.borrow();
+        for d in draws.iter() {
+            if let Draw::Text(r, s, f, tone, flags) = d {
+                draw_text(buf.dc, fonts.get(*f), s, *r, t.tone(*tone), *flags);
+            }
+        }
+    }
+
+    // ---------- grilles d'albums ----------
+
+    fn geom(&self, i: usize, width: i32) -> Geom {
+        let (min, gap) = if i == GRID_ALBUMS {
+            (self.px(160), self.px(18))
+        } else {
+            (self.px(116), self.px(12))
+        };
+        let cols = ((width + gap) / (min + gap)).max(1) as usize;
+        let cell_w = ((width - gap * (cols as i32 - 1)) / cols as i32).max(self.px(60));
+        Geom {
+            cols,
+            cell_w,
+            cell_h: cell_w + self.px(52),
+            gap,
+        }
+    }
+
+    fn grid_checked(&self, i: usize) -> Vec<String> {
+        let st = self.st.borrow();
+        if i == GRID_ALBUMS {
+            st.selected.clone()
+        } else {
+            st.cur.and_then(|c| st.rules.get(c)).map(|r| r.albums.clone()).unwrap_or_default()
+        }
+    }
+
+    /// Recalcule les albums affichés dans une grille (filtre compris).
+    fn refill_grid(&self, i: usize) {
+        let checked = self.grid_checked(i);
+        let filter = if i == GRID_ALBUMS {
+            get_text(self.c.e_filter)
+        } else {
+            String::new()
+        };
+        let rows: Vec<AlbumRow> = {
+            let st = self.st.borrow();
+            album_rows(&st.albums, &checked)
+                .into_iter()
+                .filter(|r| filter.trim().is_empty() || matches_filter(&r.name, &filter))
+                .collect()
+        };
+        {
+            let mut g = self.grids[i].borrow_mut();
+            g.focus = g.focus.min(rows.len().saturating_sub(1));
+            g.hot = None;
+            g.rows = rows;
+        }
+        self.grid_update_scroll(i);
+        invalidate(self.grid_hwnd(i));
+    }
+
+    fn grid_update_scroll(&self, i: usize) {
+        let h = self.grid_hwnd(i);
+        for _ in 0..2 {
+            let rc = client_rect(h);
+            let geo = self.geom(i, rc.right);
+            let total = {
+                let mut g = self.grids[i].borrow_mut();
+                let lines = g.rows.len().div_ceil(geo.cols) as i32;
+                g.total = (lines * (geo.cell_h + geo.gap) - geo.gap).max(0);
+                g.scroll = g.scroll.clamp(0, (g.total - rc.bottom).max(0));
+                (g.total, g.scroll)
+            };
+            let si = SCROLLINFO {
+                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                nMin: 0,
+                nMax: (total.0 - 1).max(0),
+                nPage: rc.bottom.max(0) as u32,
+                nPos: total.1,
+                nTrackPos: 0,
+            };
+            unsafe {
+                SetScrollInfo(h, SB_VERT, &si, true);
+            }
+            if client_rect(h).right == rc.right {
+                break;
+            }
+        }
+    }
+
+    fn grid_scroll_to(&self, i: usize, y: i32) {
+        let view = client_rect(self.grid_hwnd(i)).bottom;
+        {
+            let mut g = self.grids[i].borrow_mut();
+            g.scroll = y.clamp(0, (g.total - view).max(0));
+        }
+        self.grid_update_scroll(i);
+        invalidate(self.grid_hwnd(i));
+    }
+
+    fn cell_rect(&self, _i: usize, idx: usize, geo: &Geom, scroll: i32) -> RECT {
+        let (col, line) = ((idx % geo.cols) as i32, (idx / geo.cols) as i32);
+        rect(
+            col * (geo.cell_w + geo.gap),
+            line * (geo.cell_h + geo.gap) - scroll,
+            geo.cell_w,
+            geo.cell_h,
+        )
+    }
+
+    fn grid_hit(&self, i: usize, x: i32, y: i32) -> Option<usize> {
+        let rc = client_rect(self.grid_hwnd(i));
+        let geo = self.geom(i, rc.right);
+        let g = self.grids[i].borrow();
+        (0..g.rows.len()).find(|&k| {
+            let r = self.cell_rect(i, k, &geo, g.scroll);
+            x >= r.left && x < r.right && y >= r.top && y < r.top + geo.cell_w
+        })
+    }
+
+    /// Coche ou décoche l'album `idx` de la grille.
+    fn grid_toggle(&self, i: usize, idx: usize) {
+        let Some(id) = self.grids[i].borrow().rows.get(idx).map(|r| r.id.clone()) else {
+            return;
+        };
+        {
+            let mut st = self.st.borrow_mut();
+            if i == GRID_ALBUMS {
+                let on = !st.selected.contains(&id);
+                toggle_id(&mut st.selected, &id, on);
+            } else if let Some(c) = st.cur {
+                if let Some(r) = st.rules.get_mut(c) {
+                    let on = !r.albums.contains(&id);
+                    toggle_id(&mut r.albums, &id, on);
+                }
+            }
+        }
+        self.grids[i].borrow_mut().focus = idx;
+        invalidate(self.grid_hwnd(i));
+        if i == GRID_ALBUMS {
+            self.layout_content(); // nombre d'albums dans l'en-tête
+        } else {
+            self.refresh_rule_buttons();
+        }
+    }
+
+    fn grid_ensure_visible(&self, i: usize, idx: usize) {
+        let rc = client_rect(self.grid_hwnd(i));
+        let geo = self.geom(i, rc.right);
+        let scroll = self.grids[i].borrow().scroll;
+        let r = self.cell_rect(i, idx, &geo, scroll);
+        if r.top < 0 {
+            self.grid_scroll_to(i, scroll + r.top);
+        } else if r.bottom > rc.bottom {
+            self.grid_scroll_to(i, scroll + r.bottom - rc.bottom);
+        }
+    }
+
+    fn grid_key(&self, i: usize, vk: usize) -> bool {
+        let rc = client_rect(self.grid_hwnd(i));
+        let geo = self.geom(i, rc.right);
+        let (n, focus) = {
+            let g = self.grids[i].borrow();
+            (g.rows.len(), g.focus)
+        };
+        if n == 0 {
+            return false;
+        }
+        let page = ((rc.bottom / (geo.cell_h + geo.gap)).max(1) as usize) * geo.cols;
+        let next = match vk {
+            VK_LEFT => focus.saturating_sub(1),
+            VK_RIGHT => (focus + 1).min(n - 1),
+            VK_UP => focus.saturating_sub(geo.cols),
+            VK_DOWN => (focus + geo.cols).min(n - 1),
+            VK_PRIOR => focus.saturating_sub(page),
+            VK_NEXT => (focus + page).min(n - 1),
+            VK_HOME => 0,
+            VK_END => n - 1,
+            _ => return false,
+        };
+        self.grids[i].borrow_mut().focus = next;
+        self.grid_ensure_visible(i, next);
+        invalidate(self.grid_hwnd(i));
+        true
+    }
+
+    fn paint_grid(&self, i: usize, dc: HDC) {
+        let t = self.t();
+        let p = |v| self.px(v);
+        let h = self.grid_hwnd(i);
+        let rc = client_rect(h);
+        let bg = if i == GRID_ALBUMS { t.bg } else { t.card };
+        let buf = Buffer::new(dc, rc);
+        buf.fill(rc, bg);
+        let geo = self.geom(i, rc.right);
+        let checked = self.grid_checked(i);
+        let server = self.st.borrow().cover_server.clone();
+        let has_focus = unsafe { GetFocus() } == h;
+        let fonts = self.fonts.borrow();
+        let g = self.grids[i].borrow();
+        if g.rows.is_empty() {
+            let has_albums = !self.st.borrow().albums.is_empty();
+            let msg = if has_albums {
+                "Aucun album ne correspond."
+            } else {
+                "Teste la connexion (page Serveur) pour afficher tes albums."
+            };
+            let r = rect(p(16), rc.bottom / 2 - p(30), rc.right - p(32), p(60));
+            draw_text(
+                buf.dc,
+                fonts.body,
+                msg,
+                r,
+                t.muted,
+                DT_WORDBREAK | windows::Win32::Graphics::Gdi::DT_CENTER,
+            );
+            return;
+        }
+        let mut texts = vec![];
+        {
+            let cv = Canvas::new(buf.dc);
+            for (k, row) in g.rows.iter().enumerate() {
+                let cell = self.cell_rect(i, k, &geo, g.scroll);
+                if cell.bottom < 0 || cell.top > rc.bottom {
+                    continue;
+                }
+                let on = checked.contains(&row.id);
+                let hot = g.hot == Some(k);
+                let thumb = rect(cell.left, cell.top, geo.cell_w, geo.cell_w);
+                let radius = p(14) as f32;
+                if on {
+                    cv.fill_round(rf(thumb), radius, t.soft);
+                }
+                let img = if on { inset(thumb, p(10)) } else { thumb };
+                match (!row.thumb.is_empty()).then(|| cached_cover(&server, &row.thumb)).flatten() {
+                    Some(cover) => cv.image_round(&cover, rf(img), if on { p(10) as f32 } else { radius }),
+                    None => {
+                        cv.fill_round(
+                            rf(img),
+                            if on { p(10) as f32 } else { radius },
+                            if t.dark { 0x2C2C2C } else { 0xE9E9E6 },
+                        );
+                        let is = (geo.cell_w / 4).max(p(24));
+                        let ix = img.left + (img.right - img.left - is) / 2;
+                        let iy = img.top + (img.bottom - img.top - is) / 2;
+                        cv.icon(Icon::Albums, ix as f32, iy as f32, is as f32, t.muted);
+                    }
+                }
+                let (cx, cy, cr) = ((thumb.left + p(20)) as f32, (thumb.top + p(20)) as f32, p(11) as f32);
+                if on {
+                    cv.fill_circle(cx, cy, cr, argb(t.primary));
+                    let is = p(14) as f32;
+                    cv.icon(Icon::Check, cx - is / 2.0, cy - is / 2.0, is, t.on_primary);
+                } else if hot {
+                    cv.fill_circle(cx, cy, cr, 0x5A00_0000);
+                    cv.stroke_circle(cx, cy, cr - 1.0, 0xFFFF_FFFF, p(2) as f32);
+                }
+                if has_focus && g.focus == k {
+                    let fr = inset(thumb, -p(3));
+                    cv.stroke_round(rf(fr), radius + p(3) as f32, argb(t.primary), p(2) as f32);
+                }
+                let ty = thumb.bottom + p(8);
+                let name_r = rect(cell.left + p(2), ty, geo.cell_w - p(4), p(20));
+                let count_r = rect(cell.left + p(2), ty + p(21), geo.cell_w - p(4), p(18));
+                texts.push((name_r, row.name.clone(), fonts.semi, t.fg));
+                texts.push((count_r, items_label(row.count), fonts.small, t.muted));
+            }
+        }
+        for (r, s, f, c) in texts {
+            draw_text(buf.dc, f, &s, r, c, DT_SINGLELINE | DT_END_ELLIPSIS);
         }
     }
 
     // ---------- messages ----------
 
     fn handle(&self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        if let Some(i) = self.grid_of(hwnd) {
+            return self.handle_grid(i, hwnd, msg, wp, lp);
+        }
         match msg {
+            WM_ERASEBKGND => return Some(LRESULT(1)),
+            WM_PAINT => {
+                unsafe {
+                    let mut ps = PAINTSTRUCT::default();
+                    let dc = BeginPaint(hwnd, &mut ps);
+                    if hwnd == self.hwnd {
+                        self.paint_main(dc);
+                    } else {
+                        self.paint_content(dc);
+                    }
+                    let _ = EndPaint(hwnd, &ps);
+                }
+                return Some(LRESULT(0));
+            }
             WM_COMMAND => {
                 self.command(wp.0 & 0xFFFF, (wp.0 >> 16) as u32 & 0xFFFF, HWND(lp.0 as *mut _));
                 return Some(LRESULT(0));
             }
-            WM_NOTIFY if lp.0 != 0 => return Some(LRESULT(self.notify(lp.0))),
-            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLORDLG => {
-                let bg = if hwnd == self.hwnd { COLOR_BTNFACE } else { COLOR_WINDOW };
+            WM_DRAWITEM if lp.0 != 0 => {
+                self.draw_item(unsafe { &*(lp.0 as *const DRAWITEMSTRUCT) });
+                return Some(LRESULT(1));
+            }
+            WM_CTLCOLOREDIT => {
+                let t = self.t();
                 let dc = HDC(wp.0 as *mut _);
                 unsafe {
-                    if let Some(&col) = self.colors.borrow().get(&lp.0) {
-                        SetTextColor(dc, COLORREF(col));
-                    }
-                    SetBkColor(dc, COLORREF(sys_color(bg)));
-                    return Some(LRESULT(GetSysColorBrush(bg).0 as isize));
+                    SetTextColor(dc, colorref(t.fg));
+                    SetBkColor(dc, colorref(t.field));
                 }
+                return Some(LRESULT(self.field_brush.get().0 as isize));
             }
             _ => {}
         }
-        if hwnd != self.hwnd {
-            return None;
+        if hwnd == self.c.content {
+            return match msg {
+                WM_SIZE => {
+                    if !self.in_layout.get() {
+                        self.layout_content();
+                    }
+                    Some(LRESULT(0))
+                }
+                WM_MOUSEWHEEL => {
+                    let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                    let cur = self.st.borrow().scroll;
+                    self.scroll_to(cur - delta * self.px(64) / 120);
+                    Some(LRESULT(0))
+                }
+                WM_VSCROLL => {
+                    let cur = self.st.borrow().scroll;
+                    let pos = self.scroll_pos(hwnd, wp, cur, self.px(48));
+                    self.scroll_to(pos);
+                    Some(LRESULT(0))
+                }
+                _ => None,
+            };
         }
+        // Fenêtre principale.
         match msg {
             WM_SIZE => self.layout(),
             WM_GETMINMAXINFO if lp.0 != 0 => {
@@ -1484,18 +3052,19 @@ impl Win {
                 } else {
                     let f = self.st.borrow().focus;
                     if f != 0 {
-                        let _ = SetFocus(Some(HWND(f as *mut _)));
+                        let _ = SetFocus(Some(hwnd_of(f)));
                     }
                 }
             },
             WM_DPICHANGED if lp.0 != 0 => {
                 self.dpi.set(((wp.0 & 0xFFFF) as u32).max(96));
-                let old = self.font.replace(message_font(self.dpi.get()));
-                for h in &self.ctls {
-                    send(*h, WM_SETFONT, self.font.get().0 as usize, 0);
+                *self.fonts.borrow_mut() = Fonts::new(self.dpi.get());
+                let body = self.fonts.borrow().body;
+                for h in &self.edits {
+                    send(*h, WM_SETFONT, body.0 as usize, 0);
                 }
+                self.set_icons();
                 unsafe {
-                    let _ = DeleteObject(HGDIOBJ(old.0));
                     let r = *(lp.0 as *const RECT);
                     let _ = SetWindowPos(
                         self.hwnd,
@@ -1508,6 +3077,15 @@ impl Win {
                     );
                 }
                 self.layout();
+                self.refill_grid(GRID_ALBUMS);
+                self.refill_grid(GRID_RULE);
+            }
+            WM_SETTINGCHANGE => {
+                let dark = system_dark();
+                if dark != self.t().dark {
+                    self.apply_theme(if dark { DARK } else { LIGHT });
+                }
+                return None;
             }
             WM_TIMER => self.refresh_status(),
             WM_APP_DONE => self.take_done(),
@@ -1525,147 +3103,195 @@ impl Win {
         Some(LRESULT(0))
     }
 
-    fn command(&self, id: usize, code: u32, ctl: HWND) {
-        let c = &self.c;
-        match () {
-            _ if id == ID_SAVE => {
-                self.save();
-            }
-            _ if id == ID_CLOSE => self.close(),
-            _ if ctl == c.e_url && code == EN_CHANGE => self.update_http_warn(),
-            _ if ctl == c.e_filter && code == EN_CHANGE => self.fill_albums(),
-            _ if ctl == c.lb_rules && code == LBN_SELCHANGE => {
-                let i = send(c.lb_rules, LB_GETCURSEL, 0, 0);
-                self.st.borrow_mut().cur = usize::try_from(i).ok();
-                self.load_rule();
-            }
-            _ if ctl == c.cb_season && code == CBN_SELCHANGE => {
-                let season = choice_value(SEASONS, combo_sel(c.cb_season));
-                let changed = {
-                    let mut st = self.st.borrow_mut();
-                    match st.cur {
-                        Some(i) if i < st.rules.len() => {
-                            st.rules[i].season = season;
-                            true
-                        }
-                        _ => false,
-                    }
+    /// Nouvelle position après un message WM_VSCROLL.
+    fn scroll_pos(&self, h: HWND, wp: WPARAM, cur: i32, line: i32) -> i32 {
+        let view = client_rect(h).bottom;
+        match (wp.0 & 0xFFFF) as i32 {
+            0 => cur - line,   // SB_LINEUP
+            1 => cur + line,   // SB_LINEDOWN
+            2 => cur - view,   // SB_PAGEUP
+            3 => cur + view,   // SB_PAGEDOWN
+            6 => 0,            // SB_TOP
+            7 => i32::MAX / 2, // SB_BOTTOM
+            4 | 5 => {
+                // SB_THUMBPOSITION, SB_THUMBTRACK
+                let mut si = SCROLLINFO {
+                    cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_ALL,
+                    ..Default::default()
                 };
-                if changed {
-                    self.refresh_rule_label();
-                }
-            }
-            _ if code != BN_CLICKED => {}
-            _ if ctl == c.b_test || ctl == c.b_reload => self.test(false),
-            _ if ctl == c.b_next => self.next(),
-            _ if ctl == c.b_show_excluded => self.clear_excluded(),
-            _ if ctl == c.b_add_rule => {
-                {
-                    let mut st = self.st.borrow_mut();
-                    st.rules.push(AlbumRule::default());
-                    st.cur = Some(st.rules.len() - 1);
-                }
-                self.fill_rules();
                 unsafe {
-                    let _ = SetFocus(Some(c.cb_season));
+                    let _ = GetScrollInfo(h, SB_VERT, &mut si);
                 }
+                si.nTrackPos
             }
-            _ if ctl == c.b_del_rule => {
-                {
-                    let mut st = self.st.borrow_mut();
-                    if let Some(i) = st.cur.filter(|&i| i < st.rules.len()) {
-                        st.rules.remove(i);
-                    }
-                }
-                self.fill_rules();
-            }
-            _ => {}
+            _ => cur,
         }
     }
 
-    fn notify(&self, lp: isize) -> isize {
-        let c = &self.c;
-        let hdr = unsafe { &*(lp as *const NMHDR) };
-        let from = hdr.hwndFrom;
-        match hdr.code {
-            TCN_SELCHANGE if from == c.tab => {
-                let i = send(c.tab, TCM_GETCURSEL, 0, 0);
-                if let Ok(i) = usize::try_from(i) {
-                    self.show_page(i);
+    fn handle_grid(&self, i: usize, h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        match msg {
+            WM_ERASEBKGND => return Some(LRESULT(1)),
+            WM_PAINT => unsafe {
+                let mut ps = PAINTSTRUCT::default();
+                let dc = BeginPaint(h, &mut ps);
+                self.paint_grid(i, dc);
+                let _ = EndPaint(h, &ps);
+            },
+            WM_SIZE => {
+                self.grid_update_scroll(i);
+                invalidate(h);
+            }
+            WM_GETDLGCODE => return Some(LRESULT(DLGC_WANTARROWS | DLGC_WANTCHARS)),
+            WM_SETFOCUS | WM_KILLFOCUS => invalidate(h),
+            WM_LBUTTONDOWN => {
+                unsafe {
+                    let _ = SetFocus(Some(h));
+                }
+                let (x, y) = ((lp.0 & 0xFFFF) as u16 as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32);
+                if let Some(k) = self.grid_hit(i, x, y) {
+                    self.grid_toggle(i, k);
                 }
             }
-            LVN_ITEMCHANGED if from == c.lv_albums || from == c.lv_rule => {
-                if self.filling.get() {
-                    return 0;
-                }
-                let nm = unsafe { &*(lp as *const NMLISTVIEW) };
-                let mask = LVIS_STATEIMAGEMASK.0;
-                if nm.uChanged.0 & LVIF_STATE.0 == 0 || (nm.uNewState ^ nm.uOldState) & mask == 0 || nm.uOldState & mask == 0 {
-                    return 0;
-                }
-                let Ok(i) = usize::try_from(nm.iItem) else { return 0 };
-                let on = nm.uNewState & mask == 2 << 12;
-                if from == c.lv_albums {
-                    {
-                        let mut st = self.st.borrow_mut();
-                        if let Some(id) = st.rows.get(i).cloned() {
-                            toggle_id(&mut st.selected, &id, on);
-                        }
-                    }
-                    self.update_count();
-                } else {
-                    {
-                        let mut st = self.st.borrow_mut();
-                        let id = st.rule_rows.get(i).cloned();
-                        if let (Some(cur), Some(id)) = (st.cur, id) {
-                            if let Some(r) = st.rules.get_mut(cur) {
-                                toggle_id(&mut r.albums, &id, on);
-                            }
-                        }
-                    }
-                    self.refresh_rule_label();
-                }
-            }
-            LVN_GETEMPTYMARKUP if from == c.lv_albums || from == c.lv_rule => {
-                let text = {
-                    let st = self.st.borrow();
-                    if from == c.lv_rule && st.cur.is_none() {
-                        "Ajoute ou choisis une règle à gauche."
-                    } else if !st.albums.is_empty() || (from == c.lv_albums && !st.selected.is_empty()) {
-                        "Aucun album ne correspond."
-                    } else {
-                        "Teste la connexion (onglet Serveur) pour afficher tes albums."
-                    }
-                };
-                let m = unsafe { &mut *(lp as *mut NMLVEMPTYMARKUP) };
-                m.dwFlags = EMF_CENTERED;
-                let t: Vec<u16> = text.encode_utf16().take(m.szMarkup.len() - 1).chain(std::iter::once(0)).collect();
-                m.szMarkup[..t.len()].copy_from_slice(&t);
-                return 1;
-            }
-            DTN_DATETIMECHANGE if from == c.dt_rfrom || from == c.dt_rto => {
-                if self.filling.get() {
-                    return 0;
-                }
-                let (f, t) = (clock_value(c.dt_rfrom), clock_value(c.dt_rto));
+            WM_MOUSEMOVE => {
+                let (x, y) = ((lp.0 & 0xFFFF) as u16 as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32);
+                let hit = self.grid_hit(i, x, y);
                 let changed = {
-                    let mut st = self.st.borrow_mut();
-                    match st.cur {
-                        Some(i) if i < st.rules.len() => {
-                            st.rules[i].from = f;
-                            st.rules[i].to = t;
-                            true
-                        }
-                        _ => false,
-                    }
+                    let mut g = self.grids[i].borrow_mut();
+                    let changed = g.hot != hit;
+                    g.hot = hit;
+                    changed
                 };
                 if changed {
-                    self.refresh_rule_label();
+                    invalidate(h);
+                    let mut t = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: h,
+                        dwHoverTime: 0,
+                    };
+                    unsafe {
+                        let _ = TrackMouseEvent(&mut t);
+                    }
+                }
+            }
+            WM_MOUSELEAVE => {
+                self.grids[i].borrow_mut().hot = None;
+                invalidate(h);
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                let s = self.grids[i].borrow().scroll;
+                self.grid_scroll_to(i, s - delta * self.px(80) / 120);
+            }
+            WM_VSCROLL => {
+                let s = self.grids[i].borrow().scroll;
+                let pos = self.scroll_pos(h, wp, s, self.px(60));
+                self.grid_scroll_to(i, pos);
+            }
+            WM_KEYDOWN => {
+                if !self.grid_key(i, wp.0) {
+                    return None;
+                }
+            }
+            WM_CHAR if wp.0 == 0x20 => {
+                let f = self.grids[i].borrow().focus;
+                self.grid_toggle(i, f);
+            }
+            _ => return None,
+        }
+        Some(LRESULT(0))
+    }
+
+    fn command(&self, id: usize, code: u32, ctl: HWND) {
+        let c = &self.c;
+        if id == ID_SAVE && (code == BN_CLICKED || ctl.is_invalid()) {
+            self.save();
+            return;
+        }
+        if id == ID_CLOSE && (code == BN_CLICKED || ctl.is_invalid()) {
+            self.close();
+            return;
+        }
+        match code {
+            EN_CHANGE => {
+                if self.filling.get() {
+                    return;
+                }
+                if ctl == c.e_url {
+                    self.update_http_warn();
+                } else if ctl == c.e_filter {
+                    self.grids[GRID_ALBUMS].borrow_mut().scroll = 0;
+                    self.refill_grid(GRID_ALBUMS);
+                } else if ctl == c.e_rfrom || ctl == c.e_rto {
+                    let (f, t) = (get_text(c.e_rfrom).trim().to_string(), get_text(c.e_rto).trim().to_string());
+                    {
+                        let mut st = self.st.borrow_mut();
+                        if let Some(r) = st.cur.and_then(|i| st.rules.get_mut(i)) {
+                            r.from = f;
+                            r.to = t;
+                        }
+                    }
+                    self.refresh_rule_buttons();
+                }
+            }
+            EN_SETFOCUS | EN_KILLFOCUS => {
+                if code == EN_SETFOCUS {
+                    self.ensure_visible(ctl);
+                }
+                invalidate(c.content);
+            }
+            BN_SETFOCUS => self.ensure_visible(ctl),
+            BN_CLICKED | BN_DOUBLECLICKED => {
+                let kind = self.owners.borrow().get(&(ctl.0 as isize)).map(|o| o.kind);
+                match kind {
+                    Some(Kind::Toggle) => {
+                        let on = !self.on(ctl);
+                        self.set_on(ctl, on);
+                    }
+                    _ if code == BN_DOUBLECLICKED => {}
+                    Some(Kind::Nav(i)) => self.show_page(i),
+                    Some(Kind::Select(_)) => self.open_select(ctl),
+                    Some(Kind::Rule(i)) => {
+                        self.st.borrow_mut().cur = Some(i);
+                        self.load_rule();
+                    }
+                    _ if ctl == c.b_test || ctl == c.b_reload => self.test(false),
+                    _ if ctl == c.b_next => self.next(),
+                    _ if ctl == c.b_show_excluded => self.clear_excluded(),
+                    _ if ctl == c.b_add_rule => {
+                        {
+                            let mut st = self.st.borrow_mut();
+                            st.rules.push(AlbumRule::default());
+                            st.cur = Some(st.rules.len() - 1);
+                        }
+                        self.fill_rules();
+                        unsafe {
+                            let _ = SetFocus(Some(c.s_season));
+                        }
+                    }
+                    _ if ctl == c.b_del_rule => {
+                        {
+                            let mut st = self.st.borrow_mut();
+                            if let Some(i) = st.cur.filter(|&i| i < st.rules.len()) {
+                                st.rules.remove(i);
+                                st.cur = if st.rules.is_empty() {
+                                    None
+                                } else {
+                                    Some(i.min(st.rules.len() - 1))
+                                };
+                            }
+                        }
+                        self.fill_rules();
+                        unsafe {
+                            let _ = SetFocus(Some(c.b_add_rule));
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}
         }
-        0
     }
 
     // ---------- contenu ----------
@@ -1674,47 +3300,42 @@ impl Win {
         let ui = self.settings.load();
         let cfg = &ui.cfg;
         let c = &self.c;
+        self.filling.set(true);
         set_text(c.e_url, &cfg.server_url);
-        set_checked(c.c_insecure, cfg.insecure_skip_verify);
+        self.set_on(c.t_insecure, cfg.insecure_skip_verify);
 
-        let interval = if cfg.interval_minutes < 1 {
-            60
-        } else {
-            cfg.interval_minutes.min(99999)
-        };
-        send(c.ud_interval, UDM_SETPOS32, 0, interval as isize);
+        let interval = if cfg.interval_minutes < 1 { 60 } else { cfg.interval_minutes };
         set_text(c.e_interval, &interval.to_string());
-        set_combo(c.cb_style, choice_index(STYLES, &cfg.style));
-        set_combo(c.cb_size, choice_index(SIZES, &cfg.image_size));
-        set_combo(c.cb_monitor, choice_index(MONITORS, &cfg.multi_monitor));
-        let offline = cfg.offline_cache.clamp(0, 500);
-        send(c.ud_offline, UDM_SETPOS32, 0, offline as isize);
-        set_text(c.e_offline, &offline.to_string());
-        set_checked(c.c_split, cfg.split_wide);
-        set_checked(c.c_landscape, cfg.landscape_only);
-        set_checked(c.c_start, cfg.change_on_start);
-        set_checked(c.c_unlock, cfg.change_on_unlock);
+        self.set_sel(c.s_style, choice_index(STYLES, &cfg.style));
+        self.set_sel(c.s_size, choice_index(SIZES, &cfg.image_size));
+        self.set_sel(c.s_monitor, choice_index(MONITORS, &cfg.multi_monitor));
+        set_text(c.e_offline, &cfg.offline_cache.clamp(0, 500).to_string());
+        self.set_on(c.t_split, cfg.split_wide);
+        self.set_on(c.t_landscape, cfg.landscape_only);
+        self.set_on(c.t_start, cfg.change_on_start);
+        self.set_on(c.t_unlock, cfg.change_on_unlock);
 
-        set_clock(c.dt_from, &cfg.active_from, "22:00");
-        set_clock(c.dt_to, &cfg.active_to, "07:00");
-        set_checked(c.c_battery, cfg.pause_on_battery);
-        set_checked(c.c_metered, cfg.pause_on_metered);
-        set_checked(c.c_fullscreen, cfg.pause_on_fullscreen);
-        set_checked(c.c_preload, cfg.preload);
+        set_text(c.e_from, &cfg.active_from);
+        set_text(c.e_to, &cfg.active_to);
+        self.set_on(c.t_battery, cfg.pause_on_battery);
+        self.set_on(c.t_metered, cfg.pause_on_metered);
+        self.set_on(c.t_fullscreen, cfg.pause_on_fullscreen);
+        self.set_on(c.t_preload, cfg.preload);
 
-        set_checked(c.c_place, cfg.show_place);
-        set_checked(c.c_date, cfg.show_date);
-        set_combo(c.cb_caption, choice_index(CAPTIONS, &cfg.caption_position));
-        set_checked(c.c_link, cfg.desktop_link);
-        set_checked(c.c_lock, cfg.lock_screen);
+        self.set_on(c.t_place, cfg.show_place);
+        self.set_on(c.t_date, cfg.show_date);
+        self.set_sel(c.s_caption, choice_index(CAPTIONS, &cfg.caption_position));
+        self.set_on(c.t_link, cfg.desktop_link);
+        self.set_on(c.t_lock, cfg.lock_screen);
 
-        set_checked(c.c_update, cfg.auto_update);
-        let mut version = format!("Version {VERSION}");
+        self.set_on(c.t_update, cfg.auto_update);
         if self.portable {
-            set_text(c.c_update, "Vérifier chaque jour si une nouvelle version est publiée sur GitHub");
-            version += " (portable)";
+            self.set_owner(c.t_update, |o| {
+                o.text = "Vérifier chaque jour si une nouvelle version existe".into();
+                o.desc = format!("{UPDATE_PORTABLE_HINT}\n{UPDATE_HINT}");
+            });
         }
-        set_text(c.s_version, &version);
+        self.filling.set(false);
 
         {
             let mut st = self.st.borrow_mut();
@@ -1727,15 +3348,14 @@ impl Win {
         }
         self.update_key_cue();
         self.update_pin_hint();
-        self.update_excluded();
-        self.fill_albums();
-        self.fill_rules();
         self.update_http_warn();
+        self.fill_rules();
+        self.refill_grid(GRID_ALBUMS);
         let clean = self.form_key();
         self.st.borrow_mut().clean = clean;
 
         if let Some(e) = &ui.error {
-            self.set_msg(&format!("config.json illisible : {e}"), COLOR_ERR);
+            self.set_msg(&format!("config.json illisible : {e}"), Tone::Err);
         }
         if ui.has_key && !cfg.server_url.is_empty() {
             self.test(true);
@@ -1749,28 +3369,28 @@ impl Win {
         let mut cfg = Config {
             server_url: get_text(c.e_url),
             api_key: get_text(c.e_key),
-            insecure_skip_verify: is_checked(c.c_insecure),
+            insecure_skip_verify: self.on(c.t_insecure),
             interval_minutes: num(c.e_interval).filter(|&v| v >= 1).unwrap_or(60),
-            style: choice_value(STYLES, combo_sel(c.cb_style)),
-            image_size: choice_value(SIZES, combo_sel(c.cb_size)),
-            multi_monitor: choice_value(MONITORS, combo_sel(c.cb_monitor)),
+            style: self.sel_value(c.s_style, STYLES),
+            image_size: self.sel_value(c.s_size, SIZES),
+            multi_monitor: self.sel_value(c.s_monitor, MONITORS),
             offline_cache: num(c.e_offline).unwrap_or(0).clamp(0, 500),
-            split_wide: is_checked(c.c_split),
-            landscape_only: is_checked(c.c_landscape),
-            change_on_start: is_checked(c.c_start),
-            change_on_unlock: is_checked(c.c_unlock),
-            active_from: clock_value(c.dt_from),
-            active_to: clock_value(c.dt_to),
-            pause_on_battery: is_checked(c.c_battery),
-            pause_on_metered: is_checked(c.c_metered),
-            pause_on_fullscreen: is_checked(c.c_fullscreen),
-            preload: is_checked(c.c_preload),
-            show_place: is_checked(c.c_place),
-            show_date: is_checked(c.c_date),
-            caption_position: choice_value(CAPTIONS, combo_sel(c.cb_caption)),
-            desktop_link: is_checked(c.c_link),
-            lock_screen: is_checked(c.c_lock),
-            auto_update: is_checked(c.c_update),
+            split_wide: self.on(c.t_split),
+            landscape_only: self.on(c.t_landscape),
+            change_on_start: self.on(c.t_start),
+            change_on_unlock: self.on(c.t_unlock),
+            active_from: get_text(c.e_from).trim().to_string(),
+            active_to: get_text(c.e_to).trim().to_string(),
+            pause_on_battery: self.on(c.t_battery),
+            pause_on_metered: self.on(c.t_metered),
+            pause_on_fullscreen: self.on(c.t_fullscreen),
+            preload: self.on(c.t_preload),
+            show_place: self.on(c.t_place),
+            show_date: self.on(c.t_date),
+            caption_position: self.sel_value(c.s_caption, CAPTIONS),
+            desktop_link: self.on(c.t_link),
+            lock_screen: self.on(c.t_lock),
+            auto_update: self.on(c.t_update),
             ..Config::default()
         };
         let st = self.st.borrow();
@@ -1796,7 +3416,9 @@ impl Win {
                 false
             }
             Ok(saved) => {
+                self.filling.set(true);
                 set_text(self.c.e_key, "");
+                self.filling.set(false);
                 let fp_changed = {
                     let mut st = self.st.borrow_mut();
                     st.has_key = true;
@@ -1810,7 +3432,7 @@ impl Win {
                 }
                 let clean = self.form_key();
                 self.st.borrow_mut().clean = clean;
-                self.set_msg("Enregistré ✓", COLOR_OK);
+                self.set_msg("Réglages enregistrés", Tone::Ok);
                 true
             }
         }
@@ -1845,7 +3467,7 @@ impl Win {
         enable(self.c.b_test, false);
         enable(self.c.b_reload, false);
         if !quiet {
-            self.set_test_msg("Connexion…", 0);
+            self.set_test_msg("Connexion…", Tone::Muted);
         }
         let input = self.form();
         let s = self.settings.clone();
@@ -1854,6 +3476,36 @@ impl Win {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.albums(input).map_err(|e| e.to_string())))
                 .unwrap_or_else(|p| Err(format!("erreur interne : {}", panic_message(&*p))));
             finish(h, Done::Albums { quiet, res });
+        });
+    }
+
+    /// Télécharge en arrière-plan les vignettes de couverture des albums affichés.
+    fn load_covers(&self) {
+        let input = self.form();
+        let Ok(server) = normalize_server_url(&input.server_url) else {
+            return;
+        };
+        let ids: Vec<String> = {
+            let mut st = self.st.borrow_mut();
+            st.cover_server = server;
+            st.albums
+                .iter()
+                .map(|a| a.album_thumbnail_asset_id.clone())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let s = self.settings.clone();
+        let h = self.hwnd.0 as isize;
+        std::thread::spawn(move || {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                s.album_covers(input, &ids, |_, _| finish(h, Done::Cover))
+            }));
+            if let Ok(Err(e)) = res {
+                logf!("vignettes d'albums : {e}");
+            }
         });
     }
 
@@ -1868,7 +3520,7 @@ impl Win {
             st.changing = true;
         }
         enable(self.c.b_next, false);
-        self.set_msg("Changement en cours…", 0);
+        self.set_msg("Changement en cours…", Tone::Muted);
         let h = self.hwnd.0 as isize;
         std::thread::spawn(move || {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hooks.next()))
@@ -1886,6 +3538,7 @@ impl Win {
             *q = rest;
             mine.into_iter().map(|(_, d)| d).collect()
         };
+        let mut covers = false;
         for d in mine {
             match d {
                 Done::Albums { quiet, res } => {
@@ -1893,74 +3546,63 @@ impl Win {
                     enable(self.c.b_test, true);
                     enable(self.c.b_reload, true);
                     match res {
-                        Err(e) => self.set_test_msg(&e, COLOR_ERR),
+                        Err(e) => self.set_test_msg(&e, Tone::Err),
                         Ok(albums) => {
                             let n = albums.len();
-                            let goto_albums = {
+                            let go = {
                                 let mut st = self.st.borrow_mut();
                                 st.albums = albums;
                                 !quiet && st.selected.is_empty() && st.page == PAGE_SERVER
                             };
                             LOADED_ALBUMS.store(n, Ordering::SeqCst);
-                            self.set_test_msg(&format!("Connecté — {n} albums"), COLOR_OK);
-                            self.fill_albums();
-                            self.fill_rule_albums();
-                            if goto_albums {
-                                self.show_page(PAGE_ALBUMS); // étape suivante : cocher les albums
+                            self.set_test_msg(&format!("✓ Connecté — {n} albums"), Tone::Ok);
+                            self.refill_grid(GRID_ALBUMS);
+                            self.refill_grid(GRID_RULE);
+                            self.load_covers();
+                            if go {
+                                self.show_page(PAGE_ALBUMS); // étape suivante : choisir les albums
                             }
                         }
                     }
                 }
+                Done::Cover => covers = true,
                 Done::Next(res) => {
                     self.st.borrow_mut().changing = false;
                     enable(self.c.b_next, true);
                     match res {
-                        Ok(m) => self.set_msg(&m, COLOR_OK),
-                        Err(e) => self.set_msg(&e, COLOR_ERR),
+                        Ok(m) => self.set_msg(&m, Tone::Ok),
+                        Err(e) => self.set_msg(&e, Tone::Err),
                     }
                     self.refresh_status();
                 }
             }
+        }
+        if covers {
+            invalidate(self.c.grid_albums);
+            invalidate(self.c.grid_rule);
         }
     }
 
     fn clear_excluded(&self) {
         if let Some(h) = self.settings.hooks() {
             if let Err(e) = h.clear_excluded() {
-                self.set_msg(&e, COLOR_ERR);
+                self.set_msg(&e, Tone::Err);
                 return;
             }
         }
         self.st.borrow_mut().excluded = 0;
-        self.update_excluded();
-        self.set_msg("Photos réaffichées", COLOR_OK);
+        self.layout_content();
+        self.set_msg("Photos réaffichées", Tone::Ok);
     }
 
-    /// Texte et couleur d'un libellé (couleur 0 : texte normal).
-    fn set_colored(&self, h: HWND, text: &str, color: u32) {
-        {
-            let mut colors = self.colors.borrow_mut();
-            if color == 0 {
-                colors.remove(&(h.0 as isize));
-            } else {
-                colors.insert(h.0 as isize, color);
-            }
-        }
-        set_text(h, text);
-        invalidate(h);
+    fn set_msg(&self, text: &str, tone: Tone) {
+        self.st.borrow_mut().msg = (text.to_string(), tone);
+        invalidate(self.hwnd);
     }
 
-    fn set_msg(&self, text: &str, color: u32) {
-        self.set_colored(self.c.msg, text, color);
-        if self.ready.get() {
-            self.place_msg();
-        }
-    }
-
-    fn set_test_msg(&self, text: &str, color: u32) {
-        self.set_colored(self.c.test_msg, text, color);
-        self.set_colored(self.c.albums_msg, text, color);
-        self.layout();
+    fn set_test_msg(&self, text: &str, tone: Tone) {
+        self.st.borrow_mut().test_msg = (text.to_string(), tone);
+        self.layout_content();
     }
 
     fn refresh_status(&self) {
@@ -1969,11 +3611,11 @@ impl Win {
         let changed = {
             let mut st = self.st.borrow_mut();
             let changed = st.last_status != s;
-            st.last_status = s.clone();
+            st.last_status = s;
             changed
         };
         if changed {
-            set_text(self.c.status, &s);
+            invalidate(self.hwnd);
         }
     }
 
@@ -1987,15 +3629,13 @@ impl Win {
     }
 
     fn update_pin_hint(&self) {
-        let mut s = "Le certificat présenté lors du test est mémorisé (empreinte SHA-256) : seul ce certificat sera \
-                     accepté ensuite. S'il est renouvelé, reteste la connexion puis enregistre."
-            .to_string();
         let fp = self.st.borrow().cert_fp.clone();
+        let mut s = PIN_HINT.to_string();
         if fp.len() >= 16 {
             s += &format!(" Empreinte actuelle : {}…", &fp[..16]);
         }
-        set_text(self.c.h_pin, &s);
-        self.layout();
+        self.set_owner(self.c.t_insecure, |o| o.desc = s);
+        self.layout_content();
     }
 
     fn update_http_warn(&self) {
@@ -2007,162 +3647,93 @@ impl Win {
             changed
         };
         if changed {
-            self.layout();
+            self.layout_content();
         }
     }
 
-    fn update_excluded(&self) {
-        let n = self.st.borrow().excluded;
-        set_text(
-            self.c.excluded_info,
-            &format!("{n} photo(s) masquée(s) depuis le menu « Ne plus afficher cette photo »."),
-        );
-        self.layout();
-    }
-
-    fn update_count(&self) {
-        let n = self.st.borrow().selected.len();
-        set_text(self.c.album_count, &count_label(n));
-    }
-
-    /// Remplit une liste d'albums à cocher et renvoie les identifiants affichés.
-    fn fill_list(&self, lv: HWND, rows: &[AlbumRow], checked: &[String], filter: &str, counts: bool) -> Vec<String> {
-        self.filling.set(true);
-        send(lv, WM_SETREDRAW, 0, 0);
-        send(lv, LVM_DELETEALLITEMS, 0, 0);
-        let mut ids = vec![];
-        for r in rows {
-            if !filter.trim().is_empty() && !matches_filter(&r.name, filter) {
-                continue;
-            }
-            let mut t = wide(&r.name);
-            let it = LVITEMW {
-                mask: LVIF_TEXT,
-                iItem: ids.len() as i32,
-                pszText: PWSTR(t.as_mut_ptr()),
-                ..Default::default()
-            };
-            let i = send_ptr(lv, LVM_INSERTITEMW, 0, &it);
-            if i < 0 {
-                continue;
-            }
-            if let (true, Some(n)) = (counts, r.count) {
-                let mut t = wide(&n.to_string());
-                let sub = LVITEMW {
-                    iSubItem: 1,
-                    pszText: PWSTR(t.as_mut_ptr()),
-                    ..Default::default()
-                };
-                send_ptr(lv, LVM_SETITEMTEXTW, i as usize, &sub);
-            }
-            let image = if checked.contains(&r.id) { 2 } else { 1 };
-            let st = LVITEMW {
-                stateMask: LVIS_STATEIMAGEMASK,
-                state: LIST_VIEW_ITEM_STATE_FLAGS(image << 12),
-                ..Default::default()
-            };
-            send_ptr(lv, LVM_SETITEMSTATE, i as usize, &st);
-            ids.push(r.id.clone());
-        }
-        send(lv, WM_SETREDRAW, 1, 0);
-        invalidate(lv);
-        self.filling.set(false);
-        ids
-    }
-
-    fn fill_albums(&self) {
-        let filter = get_text(self.c.e_filter);
-        let (rows, checked) = {
-            let st = self.st.borrow();
-            (album_rows(&st.albums, &st.selected), st.selected.clone())
-        };
-        let ids = self.fill_list(self.c.lv_albums, &rows, &checked, &filter, true);
-        self.st.borrow_mut().rows = ids;
-        self.update_count();
-    }
-
-    fn fill_rule_albums(&self) {
-        let (rows, checked) = {
-            let st = self.st.borrow();
-            match st.cur.and_then(|i| st.rules.get(i)) {
-                Some(r) => (album_rows(&st.albums, &r.albums), r.albums.clone()),
-                None => (vec![], vec![]),
-            }
-        };
-        let ids = self.fill_list(self.c.lv_rule, &rows, &checked, "", false);
-        self.st.borrow_mut().rule_rows = ids;
-    }
-
+    /// Recrée les boutons de la liste des règles.
     fn fill_rules(&self) {
-        let (labels, cur) = {
+        let (n, old) = {
             let mut st = self.st.borrow_mut();
             let n = st.rules.len();
             st.cur = if n == 0 { None } else { st.cur.map(|c| c.min(n - 1)) };
-            (st.rules.iter().map(rule_label).collect::<Vec<_>>(), st.cur)
+            (n, std::mem::take(&mut st.rule_btns))
         };
-        send(self.c.lb_rules, LB_RESETCONTENT, 0, 0);
-        for l in &labels {
-            send_str(self.c.lb_rules, LB_ADDSTRING, 0, l);
+        for b in old {
+            self.owners.borrow_mut().remove(&(b.0 as isize));
+            unsafe {
+                let _ = DestroyWindow(b);
+            }
         }
-        if let Some(i) = cur {
-            send(self.c.lb_rules, LB_SETCURSEL, i, 0);
+        let page = self.st.borrow().page;
+        // Ordre de tabulation : la liste vient avant le bouton « Ajouter une règle ».
+        let mut prev = self.pages[PAGE_SCHEDULE].last().copied().unwrap_or_default();
+        let mut btns = vec![];
+        for i in 0..n {
+            let id = self.next_id.get() + 1;
+            self.next_id.set(id);
+            let b = create_owner(self.hinst, self.c.content, id, "");
+            self.owners.borrow_mut().insert(
+                b.0 as isize,
+                Owner {
+                    kind: Kind::Rule(i),
+                    text: String::new(),
+                    desc: String::new(),
+                    icon: None,
+                    on: false,
+                    sel: 0,
+                    bg: Bg::Card,
+                },
+            );
+            unsafe {
+                let _ = SetWindowPos(b, Some(prev), 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+            }
+            show_win(b, page == PAGE_RULES);
+            prev = b;
+            btns.push(b);
         }
+        self.st.borrow_mut().rule_btns = btns;
         self.load_rule();
     }
 
-    fn refresh_rule_label(&self) {
-        let (i, label) = {
-            let st = self.st.borrow();
-            match st.cur.and_then(|i| st.rules.get(i).map(|r| (i, rule_label(r)))) {
-                Some(v) => v,
-                None => return,
-            }
-        };
-        send(self.c.lb_rules, LB_DELETESTRING, i, 0);
-        send_str(self.c.lb_rules, LB_INSERTSTRING, i, &label);
-        send(self.c.lb_rules, LB_SETCURSEL, i, 0);
+    fn refresh_rule_buttons(&self) {
+        for b in self.st.borrow().rule_btns.iter() {
+            invalidate(*b);
+        }
     }
 
-    /// Affiche la règle sélectionnée dans les champs de droite.
+    /// Affiche la règle sélectionnée dans l'éditeur.
     fn load_rule(&self) {
-        let c = &self.c;
         let rule = {
             let st = self.st.borrow();
             st.cur.and_then(|i| st.rules.get(i).cloned())
         };
-        for h in [
-            c.l_season,
-            c.cb_season,
-            c.l_rhours,
-            c.dt_rfrom,
-            c.s_rto,
-            c.dt_rto,
-            c.l_ralbums,
-            c.lv_rule,
-            c.b_del_rule,
-        ] {
-            enable(h, rule.is_some());
-        }
-        self.filling.set(true);
         let r = rule.unwrap_or_default();
-        set_combo(c.cb_season, choice_index(SEASONS, &r.season));
-        set_clock(c.dt_rfrom, &r.from, "08:00");
-        set_clock(c.dt_rto, &r.to, "20:00");
+        self.filling.set(true);
+        self.set_sel(self.c.s_season, choice_index(SEASONS, &r.season));
+        set_text(self.c.e_rfrom, &r.from);
+        set_text(self.c.e_rto, &r.to);
         self.filling.set(false);
-        self.fill_rule_albums();
+        self.grids[GRID_RULE].borrow_mut().scroll = 0;
+        self.refill_grid(GRID_RULE);
+        self.refresh_rule_buttons();
+        self.layout_content();
     }
+}
+
+/// Le contrôle est actif (test).
+#[cfg(test)]
+fn is_enabled(h: HWND) -> bool {
+    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(h).as_bool() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{read_config, save_config};
-    use crate::testutil::{temp_dir, FakeImmich, ALB1, ALB2, KEY};
+    use crate::testutil::{temp_dir, FakeImmich, ALB1, ALB2, KEY, L1, L2};
     use std::time::{Duration, Instant};
     use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, PM_REMOVE};
-
-    const LVM_GETITEMCOUNT: u32 = 0x1004;
-    const LVM_GETITEMSTATE: u32 = 0x102C;
 
     /// Traite les messages du thread jusqu'à ce que la condition soit vraie (au plus `secs` s).
     fn pump_until(secs: u64, cond: impl Fn() -> bool) -> bool {
@@ -2187,34 +3758,27 @@ mod tests {
         }
     }
 
-    fn row_count(lv: HWND) -> usize {
-        send(lv, LVM_GETITEMCOUNT, 0, 0) as usize
-    }
-
-    fn set_row_checked(lv: HWND, i: usize, on: bool) {
-        let st = LVITEMW {
-            stateMask: LVIS_STATEIMAGEMASK,
-            state: LIST_VIEW_ITEM_STATE_FLAGS(if on { 2 << 12 } else { 1 << 12 }),
-            ..Default::default()
-        };
-        send_ptr(lv, LVM_SETITEMSTATE, i, &st);
-    }
-
-    fn row_checked(lv: HWND, i: usize) -> bool {
-        send(lv, LVM_GETITEMSTATE, i, LVIS_STATEIMAGEMASK.0 as isize) as u32 == 2 << 12
-    }
-
     fn click(w: &Win, h: HWND) {
-        send(w.hwnd, WM_COMMAND, (BN_CLICKED as usize) << 16, h.0 as isize);
+        let parent = if w.c.nav.contains(&h) || [w.c.b_next, w.c.b_close, w.c.b_save].contains(&h) {
+            w.hwnd
+        } else {
+            w.c.content
+        };
+        let id = unsafe { windows::Win32::UI::WindowsAndMessaging::GetDlgCtrlID(h) } as usize;
+        send(parent, WM_COMMAND, id | ((BN_CLICKED as usize) << 16), h.0 as isize);
     }
 
-    /// Fenêtre remplie depuis la configuration, relue à l'identique ; listes d'albums, règles,
-    /// enregistrement, erreurs, détection des modifications et changement de résolution.
-    #[test]
-    fn settings_window_round_trip() {
-        let fake = FakeImmich::start();
-        let cfg_path = temp_dir("settings_window").join("config.json");
-        let cfg = Config {
+    fn grid_index(w: &Win, i: usize, id: &str) -> usize {
+        w.grids[i]
+            .borrow()
+            .rows
+            .iter()
+            .position(|r| r.id == id)
+            .unwrap_or_else(|| panic!("album {id} absent de la grille {i}"))
+    }
+
+    fn sample(fake: &FakeImmich) -> Config {
+        Config {
             server_url: fake.url.clone(),
             api_key: KEY.into(),
             albums: vec![ALB2.into()],
@@ -2246,10 +3810,19 @@ mod tests {
             lock_screen: true,
             auto_update: false,
             ..Config::default()
-        };
+        }
+    }
+
+    /// Fenêtre remplie depuis la configuration, relue à l'identique ; grilles d'albums,
+    /// vignettes, règles, interrupteurs, listes, enregistrement, erreurs, détection des
+    /// modifications et changement de résolution.
+    #[test]
+    fn settings_window_round_trip() {
+        let fake = FakeImmich::start();
+        let cfg_path = temp_dir("settings_window").join("config.json");
+        let cfg = sample(&fake);
         save_config(&cfg_path, &cfg).unwrap();
-        let settings = Settings::new(&cfg_path);
-        let w = Win::create(settings).expect("création de la fenêtre");
+        let w = Win::create(Settings::new(&cfg_path)).expect("création de la fenêtre");
         let alerts = Rc::new(RefCell::new(Vec::<String>::new()));
         let answer = Rc::new(Cell::new(IDNO.0));
         {
@@ -2268,44 +3841,76 @@ mod tests {
         assert!(!w.dirty(), "modifié dès l'ouverture");
         assert_eq!(get_text(w.c.e_key), "");
 
-        // Le test de connexion lancé à l'ouverture remplit les listes.
+        // Le test de connexion lancé à l'ouverture remplit les grilles, puis les vignettes arrivent.
         assert!(pump_until(20, || loaded_albums() > 0), "albums non chargés");
         let n = w.st.borrow().albums.len();
-        assert_eq!(row_count(w.c.lv_albums), n);
-        let rows = w.st.borrow().rows.clone();
-        let i1 = rows.iter().position(|r| r == ALB1).expect("album 1 affiché");
-        let i2 = rows.iter().position(|r| r == ALB2).expect("album 2 affiché");
-        assert!(row_checked(w.c.lv_albums, i2) && !row_checked(w.c.lv_albums, i1));
-        assert_eq!(get_text(w.c.album_count), "1 album sélectionné");
+        assert_eq!(w.grids[GRID_ALBUMS].borrow().rows.len(), n);
+        let server = w.st.borrow().cover_server.clone();
+        assert!(
+            pump_until(20, || cached_cover(&server, L1).is_some() && cached_cover(&server, L2).is_some()),
+            "vignettes non chargées"
+        );
 
-        // Cocher un album passe par la notification de la liste.
-        set_row_checked(w.c.lv_albums, i1, true);
+        // Cocher un album (clic ou espace) dans la grille.
+        let i1 = grid_index(&w, GRID_ALBUMS, ALB1);
+        w.grid_toggle(GRID_ALBUMS, i1);
         assert_eq!(w.st.borrow().selected, vec![ALB2.to_string(), ALB1.to_string()]);
         assert!(w.dirty());
-        // Le filtre ne perd pas les cases cochées.
+        // Le filtre ne perd pas les albums cochés.
         set_text(w.c.e_filter, "zzz-aucun");
-        assert_eq!(row_count(w.c.lv_albums), 0);
+        assert_eq!(w.grids[GRID_ALBUMS].borrow().rows.len(), 0);
+        set_text(w.c.e_filter, "finl");
+        assert_eq!(w.grids[GRID_ALBUMS].borrow().rows.len(), 1);
         set_text(w.c.e_filter, "");
-        assert_eq!(row_count(w.c.lv_albums), n);
         assert_eq!(w.form().albums.len(), 2);
 
-        // Règles : liste, sélection, albums de la règle.
-        assert_eq!(send(w.c.lb_rules, LB_GETCURSEL, 0, 0), 0);
-        let rr = w.st.borrow().rule_rows.clone();
-        let r1 = rr.iter().position(|r| r == ALB1).unwrap();
-        let r2 = rr.iter().position(|r| r == ALB2).unwrap();
-        assert!(row_checked(w.c.lv_rule, r1));
-        set_row_checked(w.c.lv_rule, r2, true);
+        // Navigation au clavier dans la grille.
+        unsafe {
+            let _ = SetFocus(Some(w.c.grid_albums));
+        }
+        w.grids[GRID_ALBUMS].borrow_mut().focus = 0;
+        send(w.c.grid_albums, WM_KEYDOWN, VK_RIGHT, 0);
+        assert_eq!(w.grids[GRID_ALBUMS].borrow().focus, 1.min(n - 1));
+
+        // Règles : boutons de la liste, albums de la règle, ajout et suppression.
+        assert_eq!(w.st.borrow().rule_btns.len(), 1);
+        let r2 = grid_index(&w, GRID_RULE, ALB2);
+        w.grid_toggle(GRID_RULE, r2);
         assert_eq!(w.form().album_rules[0].albums.len(), 2);
+        set_text(w.c.e_rto, "13:00");
+        assert_eq!(w.form().album_rules[0].to, "13:00");
+        w.set_sel(w.c.s_season, choice_index(SEASONS, "summer"));
+        w.select_changed(w.c.s_season);
+        assert_eq!(w.form().album_rules[0].season, "summer");
         click(&w, w.c.b_add_rule);
-        assert_eq!(w.st.borrow().rules.len(), 2);
+        assert_eq!(w.st.borrow().rule_btns.len(), 2);
+        assert_eq!(w.st.borrow().cur, Some(1));
         assert_eq!(w.form().album_rules.len(), 1, "règle sans album ignorée");
+        let first = w.st.borrow().rule_btns[0];
+        click(&w, first);
+        assert_eq!(w.st.borrow().cur, Some(0));
+        assert_eq!(get_text(w.c.e_rto), "13:00");
+        click(&w, w.c.b_add_rule);
+        assert_eq!(w.st.borrow().rules.len(), 3);
         click(&w, w.c.b_del_rule);
-        assert_eq!(w.st.borrow().rules.len(), 1);
+        assert_eq!(w.st.borrow().rules.len(), 2);
+        assert_eq!(w.st.borrow().rule_btns.len(), 2);
+
+        // Interrupteurs et listes.
+        click(&w, w.c.t_lock);
+        assert!(!w.form().lock_screen);
+        click(&w, w.c.t_lock);
+        assert!(w.form().lock_screen);
+        w.set_sel(w.c.s_style, choice_index(STYLES, "span"));
+
+        // Navigation entre les pages.
+        click(&w, w.c.nav[PAGE_SCHEDULE]);
+        assert_eq!(w.st.borrow().page, PAGE_SCHEDULE);
+        let shown = |h: HWND| unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowLongW(h, windows::Win32::UI::WindowsAndMessaging::GWL_STYLE) } as u32 & WS_VISIBLE != 0;
+        assert!(shown(w.c.e_from) && !shown(w.c.e_url));
 
         // Enregistrement : le token enregistré est conservé.
         set_text(w.c.e_interval, "7");
-        set_combo(w.c.cb_style, choice_index(STYLES, "span"));
         assert!(w.save());
         assert!(!w.dirty());
         let saved = read_config(&cfg_path).unwrap();
@@ -2316,16 +3921,19 @@ mod tests {
         assert_eq!(saved.album_rules[0].albums.len(), 2);
         assert_eq!((saved.active_from.as_str(), saved.active_to.as_str()), ("22:00", "07:30"));
 
-        // Erreur de validation : expliquée, rien n'est enregistré.
+        // Erreurs : expliquées, rien n'est enregistré.
         set_text(w.c.e_url, "pas une url");
         assert!(!w.save());
-        assert_eq!(alerts.borrow().len(), 1);
         assert!(alerts.borrow()[0].contains("saisis de nouveau le token"), "{:?}", alerts.borrow());
         set_text(w.c.e_key, "autre-token");
         assert!(!w.save());
-        assert_eq!(alerts.borrow().len(), 2);
         assert!(alerts.borrow()[1].contains("server_url"), "{:?}", alerts.borrow());
         set_text(w.c.e_key, "");
+        set_text(w.c.e_url, &fake.url);
+        set_text(w.c.e_from, "25:00");
+        assert!(!w.save());
+        assert!(alerts.borrow()[2].contains("heure"), "{:?}", alerts.borrow());
+        set_text(w.c.e_from, "22:00");
         assert_eq!(read_config(&cfg_path).unwrap().server_url, fake.url);
         // Avertissement http:// vers Internet.
         set_text(w.c.e_url, "http://immich.exemple.fr");
@@ -2333,20 +3941,27 @@ mod tests {
         set_text(w.c.e_url, &fake.url);
         assert!(!w.st.borrow().http_warn && !w.dirty());
 
-        // Changement de résolution (écran à 150 %) : police et mise en page recalculées.
-        let before = client_rect(w.c.e_url).bottom;
+        // Test de connexion à la demande : bouton désactivé pendant le test.
+        click(&w, w.c.nav[PAGE_SERVER]);
+        click(&w, w.c.b_test);
+        assert!(!is_enabled(w.c.b_test));
+        assert!(pump_until(20, || is_enabled(w.c.b_test)), "test de connexion sans fin");
+        assert_eq!(w.st.borrow().test_msg.1, Tone::Ok);
+
+        // Changement de résolution (écran à 150 %) : polices et mise en page recalculées.
+        let before = client_rect(w.c.b_save).bottom;
         let r = RECT {
             left: 0,
             top: 0,
-            right: 1050,
-            bottom: 870,
+            right: 1500,
+            bottom: 1050,
         };
         send(w.hwnd, WM_DPICHANGED, (144 << 16) | 144, &r as *const RECT as isize);
         assert_eq!(w.dpi.get(), 144);
-        assert!(client_rect(w.c.e_url).bottom > before, "zone de saisie non agrandie");
+        assert!(client_rect(w.c.b_save).bottom > before, "bouton non agrandi");
 
         // Fermeture avec modifications : « Annuler » garde la fenêtre, « Non » la ferme.
-        set_checked(w.c.c_lock, false);
+        click(&w, w.c.t_lock);
         answer.set(2); // IDCANCEL
         send(w.hwnd, WM_CLOSE, 0, 0);
         assert!(is_open());
@@ -2360,7 +3975,8 @@ mod tests {
         );
     }
 
-    /// Captures de chaque onglet (IW_SETTINGS_SHOTS=<dossier>), pour vérifier la mise en page.
+    /// Captures de chaque page en thème clair et sombre (IW_SETTINGS_SHOTS=<dossier>), pour
+    /// vérifier la mise en page.
     #[test]
     fn settings_window_screenshots() {
         let Some(dir) = std::env::var_os("IW_SETTINGS_SHOTS") else {
@@ -2369,38 +3985,100 @@ mod tests {
         let dir = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fake = FakeImmich::start();
-        let cfg_path = temp_dir("settings_shots").join("config.json");
-        let cfg = Config {
-            server_url: fake.url.clone(),
-            api_key: KEY.into(),
-            albums: vec![ALB2.into()],
-            album_rules: vec![AlbumRule {
-                albums: vec![ALB1.into()],
-                season: "summer".into(),
-                from: "08:00".into(),
-                to: "20:00".into(),
-            }],
-            ..Config::default()
-        };
-        save_config(&cfg_path, &cfg).unwrap();
-        let w = Win::create(Settings::new(&cfg_path)).unwrap();
-        w.show();
-        assert!(pump_until(20, || loaded_albums() > 0));
-        for i in 0..PAGE_NAMES.len() {
-            w.show_page(i);
+        for (theme, name) in [(1u8, "clair"), (2, "sombre")] {
+            THEME_OVERRIDE.store(theme, Ordering::SeqCst);
+            let cfg_path = temp_dir("settings_shots").join("config.json");
+            let mut cfg = sample(&fake);
+            cfg.album_rules[0].season = "summer".into();
+            save_config(&cfg_path, &cfg).unwrap();
+            let w = Win::create(Settings::new(&cfg_path)).unwrap();
+            w.show();
+            let server = normalize_server_url(&fake.url).unwrap();
+            assert!(pump_until(20, || {
+                loaded_albums() > 0 && cached_cover(&server, L1).is_some() && cached_cover(&server, L2).is_some()
+            }));
+            demo_albums(&w, &server);
             pump_until(1, || false);
-            shot(w.hwnd, &dir.join(format!("onglet-{i}.png")));
+            let files = [
+                "serveur",
+                "albums",
+                "affichage",
+                "planification",
+                "saisons",
+                "legende",
+                "mises-a-jour",
+            ];
+            for (i, file) in files.iter().enumerate() {
+                w.show_page(i);
+                pump_until(1, || false);
+                shot(w.hwnd, &dir.join(format!("{name}-{i}-{file}.png")));
+            }
+            *w.alert.borrow_mut() = Some(Box::new(|_, _| IDNO.0));
+            unsafe {
+                let _ = DestroyWindow(w.hwnd);
+            }
+            pump_until(2, || !is_open());
         }
-        *w.alert.borrow_mut() = Some(Box::new(|_, _| IDNO.0));
-        unsafe {
-            let _ = DestroyWindow(w.hwnd);
+        THEME_OVERRIDE.store(0, Ordering::SeqCst);
+    }
+
+    /// Albums et vignettes colorées (dégradé, soleil, montagnes) pour des captures parlantes.
+    fn demo_albums(w: &Win, server: &str) {
+        let names = [
+            ("Bassin", 2, (0x1f6f8b, 0xf4a259)),
+            ("Finlande", 3, (0x0b1d51, 0x8fb8de)),
+            ("Bretagne 2024", 214, (0x2a9d8f, 0xe9f5db)),
+            ("Montagne", 87, (0x264653, 0xe76f51)),
+            ("Japon", 532, (0x6d2e46, 0xf7b267)),
+            ("Famille", 1290, (0x355070, 0xeaac8b)),
+            ("Lumières du nord", 45, (0x03045e, 0x00b4d8)),
+            ("Désert", 61, (0x9c6644, 0xffe8d6)),
+        ];
+        let mut albums = vec![];
+        for (k, (name, count, (top, bottom))) in names.iter().enumerate() {
+            let (id, thumb) = match k {
+                0 => (ALB2.to_string(), L2.to_string()),
+                1 => (ALB1.to_string(), L1.to_string()),
+                _ => (
+                    format!("{k:08}-0000-4000-8000-00000000000{k}"),
+                    format!("{k:08}-1111-4000-8000-00000000000{k}"),
+                ),
+            };
+            let side = 320u32;
+            let mut px = Vec::with_capacity((side * side * 4) as usize);
+            for y in 0..side {
+                for x in 0..side {
+                    let t = y as f32 / side as f32;
+                    let mut c = mix(*top, *bottom, t);
+                    let (dx, dy) = (x as f32 - side as f32 * 0.68, y as f32 - side as f32 * 0.36);
+                    if dx * dx + dy * dy < (side as f32 * 0.11).powi(2) {
+                        c = mix(c, 0xfff3c4, 0.85);
+                    }
+                    let ridge = side as f32 * (0.72 - 0.18 * ((x as f32 / side as f32) * 6.0 + k as f32).sin().abs());
+                    if y as f32 > ridge {
+                        c = mix(c, 0x10141c, 0.55);
+                    }
+                    px.extend_from_slice(&[(c & 0xFF) as u8, ((c >> 8) & 0xFF) as u8, (c >> 16) as u8, 255]);
+                }
+            }
+            crate::settings::put_cover(server, &thumb, Cover { side, bgra: px });
+            albums.push(AlbumInfo {
+                id,
+                album_name: name.to_string(),
+                asset_count: *count,
+                album_thumbnail_asset_id: thumb,
+                ..Default::default()
+            });
         }
+        sort_albums(&mut albums);
+        w.st.borrow_mut().albums = albums;
+        w.refill_grid(GRID_ALBUMS);
+        w.refill_grid(GRID_RULE);
     }
 
     /// Capture de la fenêtre (copie de l'écran à son emplacement).
     fn shot(hwnd: HWND, path: &std::path::Path) {
         use windows::Win32::Graphics::Gdi::*;
-        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
         unsafe {
             let mut r = RECT::default();
             let _ = GetWindowRect(hwnd, &mut r);
