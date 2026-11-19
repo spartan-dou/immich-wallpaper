@@ -783,6 +783,14 @@ fn selftest_report(app: &Arc<App>, out: PathBuf) {
     // configuration est valide), puis refermée sans modification.
     app.menu_command(M_SETTINGS);
     check(wait_for(10, settings_window::is_open), "fenêtre de réglages non ouverte");
+    // Ouverte ne suffit pas : elle doit être visible, même quand l'appli a été lancée « cachée »
+    // (comme le fait la mise à jour depuis les anciennes versions).
+    check(
+        wait_for(5, || unsafe {
+            IsWindowVisible(HWND(settings_window::open_hwnd() as *mut _)).as_bool()
+        }),
+        "fenêtre de réglages ouverte mais invisible",
+    );
     if app.cfg().is_some() {
         check(
             wait_for(20, || settings_window::loaded_albums() > 0),
@@ -992,6 +1000,12 @@ pub fn run() {
         }
     };
     app.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
+    unsafe {
+        // Le premier ShowWindow d'un processus suit la façon dont il a été lancé : « caché » quand
+        // c'est par la mise à jour des versions précédentes (Go : HideWindow) ou un script. Il est
+        // consommé ici, sur la fenêtre cachée de l'appli, et non par la fenêtre de réglages.
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
     unsafe {
         let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
         if let Some(icon) = load_icon(GetSystemMetrics(SM_CXSMICON)) {

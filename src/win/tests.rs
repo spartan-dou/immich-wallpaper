@@ -137,7 +137,7 @@ fn app_end_to_end() {
     cfg.normalize().unwrap();
     crate::config::save_config(&dir.join("config.json"), &cfg).unwrap();
     let out = dir.join("result.txt");
-    let status = std::process::Command::new(exe)
+    let status = std::process::Command::new(&exe)
         .arg("--selftest")
         .arg(&out)
         .arg("--selftest-dir")
@@ -154,6 +154,63 @@ fn app_end_to_end() {
         "aucune mise en favori reçue par le serveur"
     );
     assert!(dir.join("excluded.json").exists() && dir.join("recent.json").exists());
+
+    // Lancée « cachée », comme la mise à jour des versions précédentes (Go : HideWindow) le
+    // fait : la fenêtre de réglages doit quand même s'afficher.
+    let hidden = crate::testutil::temp_dir("e2e_hidden");
+    std::fs::copy(dir.join("config.json"), hidden.join("config.json")).unwrap();
+    let out = hidden.join("result.txt");
+    let code = run_hidden(
+        &exe,
+        &["--selftest", &out.to_string_lossy(), "--selftest-dir", &hidden.to_string_lossy()],
+    );
+    let report = std::fs::read_to_string(&out).unwrap_or_default();
+    let log = std::fs::read_to_string(hidden.join("journal.txt")).unwrap_or_default();
+    eprintln!("lancement caché : {report}");
+    assert!(code == 0 && report.starts_with("OK"), "{report}\n--- journal ---\n{log}");
+}
+
+/// Lance un programme avec STARTF_USESHOWWINDOW + SW_HIDE (ce que fait HideWindow en Go) et
+/// renvoie son code de sortie.
+fn run_hidden(exe: &std::ffi::OsStr, args: &[&str]) -> u32 {
+    use windows::core::PWSTR;
+    use windows::Win32::System::Threading::{
+        CreateProcessW, GetExitCodeProcess, WaitForSingleObject, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
+        STARTUPINFOW,
+    };
+    let mut line = format!("\"{}\"", exe.to_string_lossy());
+    for a in args {
+        line += &format!(" \"{a}\"");
+    }
+    let mut wline = wide(&line);
+    let si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESHOWWINDOW,
+        wShowWindow: 0, // SW_HIDE
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            None,
+            Some(PWSTR(wline.as_mut_ptr())),
+            None,
+            None,
+            false,
+            PROCESS_CREATION_FLAGS(0),
+            None,
+            None,
+            &si,
+            &mut pi,
+        )
+        .expect("lancement de l'appli");
+        WaitForSingleObject(pi.hProcess, 120_000);
+        let mut code = 0u32;
+        let _ = GetExitCodeProcess(pi.hProcess, &mut code);
+        let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
+        let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
+        code
+    }
 }
 
 /// TLS par Schannel face à un vrai serveur : vérification normale, puis épinglage du certificat.

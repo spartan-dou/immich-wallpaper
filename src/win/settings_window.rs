@@ -926,12 +926,7 @@ pub fn loaded_albums() -> usize {
 /// uniquement (celui qui fait tourner la boucle de messages).
 pub fn open(settings: Arc<Settings>) {
     if let Some(w) = current() {
-        unsafe {
-            if IsIconic(w.hwnd).as_bool() {
-                let _ = ShowWindow(w.hwnd, SW_RESTORE);
-            }
-            let _ = SetForegroundWindow(w.hwnd);
-        }
+        w.bring_to_front();
         return;
     }
     match Win::create(settings) {
@@ -1851,10 +1846,24 @@ impl Win {
     fn show(&self) {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOW);
-            let _ = SetForegroundWindow(self.hwnd);
             SetTimer(Some(self.hwnd), TIMER_STATUS, 2000, None);
         }
+        self.bring_to_front();
         self.refresh_status();
+    }
+
+    /// Affiche la fenêtre au premier plan, qu'elle soit cachée (lancement « caché » de l'appli)
+    /// ou réduite.
+    fn bring_to_front(&self) {
+        unsafe {
+            if !IsWindowVisible(self.hwnd).as_bool() {
+                let _ = ShowWindow(self.hwnd, SW_SHOW);
+            }
+            if IsIconic(self.hwnd).as_bool() {
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(self.hwnd);
+        }
     }
 
     fn message_box(&self, text: &str, flags: MESSAGEBOX_STYLE) -> i32 {
@@ -3973,6 +3982,74 @@ mod tests {
             read_config(&cfg_path).unwrap().lock_screen,
             "modification enregistrée malgré « Non »"
         );
+    }
+
+    /// Appli lancée « cachée » (STARTF_USESHOWWINDOW + SW_HIDE, ce que fait la mise à jour depuis
+    /// les versions Go) : Windows applique cet état au premier ShowWindow du processus. La fenêtre
+    /// de réglages doit quand même s'afficher. Le test se relance lui-même dans un processus
+    /// lancé ainsi, et y vérifie la fenêtre.
+    #[test]
+    fn settings_window_visible_after_hidden_start() {
+        const CHILD: &str = "IW_HIDDEN_START_CHILD";
+        const NAME: &str = "win::settings_window::tests::settings_window_visible_after_hidden_start";
+        if std::env::var_os(CHILD).is_some() {
+            let cfg_path = temp_dir("hidden_start").join("config.json");
+            crate::config::write_default_config(&cfg_path).unwrap();
+            let w = Win::create(Settings::new(&cfg_path)).expect("création de la fenêtre");
+            w.show();
+            pump_until(1, || false);
+            let visible = unsafe { IsWindowVisible(w.hwnd) }.as_bool();
+            *w.alert.borrow_mut() = Some(Box::new(|_, _| IDNO.0));
+            unsafe {
+                let _ = DestroyWindow(w.hwnd);
+            }
+            assert!(visible, "fenêtre de réglages invisible après un lancement caché");
+            return;
+        }
+        use windows::core::PWSTR;
+        use windows::Win32::System::Threading::{
+            CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
+            STARTUPINFOW,
+        };
+        let exe = std::env::current_exe().unwrap();
+        let mut line = wide(&format!("\"{}\" {NAME} --exact --test-threads=1 --nocapture", exe.display()));
+        let mut env: Vec<u16> = vec![];
+        for (k, v) in std::env::vars_os().chain([(CHILD.into(), "1".into())]) {
+            env.extend(k.to_string_lossy().encode_utf16());
+            env.push('=' as u16);
+            env.extend(v.to_string_lossy().encode_utf16());
+            env.push(0);
+        }
+        env.push(0);
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            dwFlags: STARTF_USESHOWWINDOW,
+            wShowWindow: 0, // SW_HIDE
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
+        let code = unsafe {
+            CreateProcessW(
+                None,
+                Some(PWSTR(line.as_mut_ptr())),
+                None,
+                None,
+                false,
+                CREATE_UNICODE_ENVIRONMENT,
+                Some(env.as_ptr() as *const _),
+                None,
+                &si,
+                &mut pi,
+            )
+            .expect("relance du test");
+            WaitForSingleObject(pi.hProcess, 120_000);
+            let mut code = 1u32;
+            let _ = GetExitCodeProcess(pi.hProcess, &mut code);
+            let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
+            let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
+            code
+        };
+        assert_eq!(code, 0, "le processus lancé caché a échoué (voir sa sortie ci-dessus)");
     }
 
     /// Captures de chaque page en thème clair et sombre (IW_SETTINGS_SHOTS=<dossier>), pour
