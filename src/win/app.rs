@@ -642,7 +642,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     match msg {
         WM_APP_TRAY => {
             match lparam.0 as u32 & 0xFFFF {
-                WM_LBUTTONUP => app.open_photo(), // clic gauche : ouvrir la photo affichée dans Immich
+                WM_LBUTTONUP => {
+                    // Clic gauche : fenêtre de réglages. L'appli passe au premier plan pour que la
+                    // fenêtre s'y affiche (comme avant d'ouvrir le menu).
+                    let _ = SetForegroundWindow(app.hwnd());
+                    app.open_settings();
+                }
                 WM_RBUTTONUP | WM_CONTEXTMENU => app.show_menu(),
                 _ => {}
             }
@@ -779,9 +784,11 @@ fn selftest_report(app: &Arc<App>, out: PathBuf) {
         check(GetMenuItemCount(Some(m)) >= 12, "menu incomplet");
         let _ = DestroyMenu(m);
     }
-    // Fenêtre de réglages : ouverte depuis le menu, remplie (albums du serveur de test si la
-    // configuration est valide), puis refermée sans modification.
-    app.menu_command(M_SETTINGS);
+    // Fenêtre de réglages : ouverte par un clic gauche sur l'icône, remplie (albums du serveur
+    // de test si la configuration est valide), puis refermée sans modification.
+    unsafe {
+        let _ = PostMessageW(Some(app.hwnd()), WM_APP_TRAY, WPARAM(1), LPARAM(WM_LBUTTONUP as isize));
+    }
     check(wait_for(10, settings_window::is_open), "fenêtre de réglages non ouverte");
     // Ouverte ne suffit pas : elle doit être visible, même quand l'appli a été lancée « cachée »
     // (comme le fait la mise à jour depuis les anciennes versions).

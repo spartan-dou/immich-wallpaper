@@ -195,8 +195,8 @@ const PRELOAD_HINT: &str = "Le changement suivant est alors immédiat et ne dép
                             déverrouillage du PC.";
 const RULES_HINT: &str = "Quand une règle s'applique, ses albums remplacent les albums habituels ; plusieurs règles en même \
                           temps : leurs albums sont réunis.";
-const LINK_HINT: &str = "Le fond d'écran n'est pas cliquable sous Windows : cette icône, ou un clic gauche sur l'icône près \
-                         de l'horloge, ouvre la photo affichée.";
+const LINK_HINT: &str = "Le fond d'écran n'est pas cliquable sous Windows : cette icône, ou « Voir la photo dans Immich » \
+                         dans le menu de l'icône près de l'horloge, ouvre la photo affichée.";
 const LOCK_HINT: &str = "Dans Windows : Paramètres → Personnalisation → Écran de verrouillage → « Image » (et non « Windows \
                          à la une »).";
 const UPDATE_HINT: &str = "Vérification au démarrage puis une fois par jour, depuis les releases GitHub du projet \
