@@ -926,12 +926,7 @@ pub fn loaded_albums() -> usize {
 /// uniquement (celui qui fait tourner la boucle de messages).
 pub fn open(settings: Arc<Settings>) {
     if let Some(w) = current() {
-        unsafe {
-            if IsIconic(w.hwnd).as_bool() {
-                let _ = ShowWindow(w.hwnd, SW_RESTORE);
-            }
-            let _ = SetForegroundWindow(w.hwnd);
-        }
+        w.bring_to_front();
         return;
     }
     match Win::create(settings) {
@@ -1851,10 +1846,24 @@ impl Win {
     fn show(&self) {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOW);
-            let _ = SetForegroundWindow(self.hwnd);
             SetTimer(Some(self.hwnd), TIMER_STATUS, 2000, None);
         }
+        self.bring_to_front();
         self.refresh_status();
+    }
+
+    /// Affiche la fenêtre au premier plan, qu'elle soit cachée (lancement « caché » de l'appli)
+    /// ou réduite.
+    fn bring_to_front(&self) {
+        unsafe {
+            if !IsWindowVisible(self.hwnd).as_bool() {
+                let _ = ShowWindow(self.hwnd, SW_SHOW);
+            }
+            if IsIconic(self.hwnd).as_bool() {
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(self.hwnd);
+        }
     }
 
     fn message_box(&self, text: &str, flags: MESSAGEBOX_STYLE) -> i32 {

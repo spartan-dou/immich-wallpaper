@@ -1001,6 +1001,12 @@ pub fn run() {
     };
     app.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
     unsafe {
+        // Le premier ShowWindow d'un processus suit la façon dont il a été lancé : « caché » quand
+        // c'est par la mise à jour des versions précédentes (Go : HideWindow) ou un script. Il est
+        // consommé ici, sur la fenêtre cachée de l'appli, et non par la fenêtre de réglages.
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    unsafe {
         let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
         if let Some(icon) = load_icon(GetSystemMetrics(SM_CXSMICON)) {
             app.icon.store(icon.0 as isize, Ordering::SeqCst);
