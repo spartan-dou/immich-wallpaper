@@ -783,6 +783,14 @@ fn selftest_report(app: &Arc<App>, out: PathBuf) {
     // configuration est valide), puis refermée sans modification.
     app.menu_command(M_SETTINGS);
     check(wait_for(10, settings_window::is_open), "fenêtre de réglages non ouverte");
+    // Ouverte ne suffit pas : elle doit être visible, même quand l'appli a été lancée « cachée »
+    // (comme le fait la mise à jour depuis les anciennes versions).
+    check(
+        wait_for(5, || unsafe {
+            IsWindowVisible(HWND(settings_window::open_hwnd() as *mut _)).as_bool()
+        }),
+        "fenêtre de réglages ouverte mais invisible",
+    );
     if app.cfg().is_some() {
         check(
             wait_for(20, || settings_window::loaded_albums() > 0),
