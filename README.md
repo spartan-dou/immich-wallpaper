@@ -66,7 +66,7 @@ La version portable est faite pour tourner sur un PC géré par un service infor
 
 ## Fenêtre de réglages
 
-Menu de l'icône → **Paramètres…** (elle s'ouvre aussi au premier lancement). Une fenêtre aux couleurs d'Immich, en thème clair ou sombre selon Windows (*Paramètres → Personnalisation → Couleurs*) : barre latérale, cartes arrondies, interrupteurs, et tes albums affichés avec leur photo de couverture, comme dans Immich.
+Clic gauche sur l'icône près de l'horloge, ou menu de l'icône → **Paramètres…** (elle s'ouvre aussi au premier lancement). Une fenêtre aux couleurs d'Immich, en thème clair ou sombre selon Windows (*Paramètres → Personnalisation → Couleurs*) : barre latérale, cartes arrondies, interrupteurs, et tes albums affichés avec leur photo de couverture, comme dans Immich.
 
 | Page | Contenu |
 |---|---|
@@ -122,7 +122,7 @@ La clé est chiffrée dans `config.json` avec DPAPI (`api_key_protected`, lisibl
 - **Ne plus afficher cette photo** : la masque et passe à la suivante. La liste est locale (`excluded.json`), rien n'est modifié dans Immich ; l'onglet Affichage des réglages indique le nombre de photos masquées et permet de les réafficher.
 
 Avec plusieurs photos affichées (plusieurs écrans, écran très large), ces actions portent sur celle de l'écran principal.
-- **Paramètres…** : ouvre la fenêtre de réglages (ou la ramène au premier plan).
+- **Paramètres…** : ouvre la fenêtre de réglages (ou la ramène au premier plan). Un clic gauche sur l'icône fait de même.
 - **Pause**, **Démarrer avec Windows**, **Ouvrir le journal**.
 - **Rechercher une mise à jour** : vérifie tout de suite et propose l'installation (version portable : « Installer la version… » quand une nouvelle version a été trouvée).
 - **Désinstaller…** : supprime le programme, ses réglages et le démarrage automatique (pas dans la version portable).
@@ -145,7 +145,7 @@ Réglages → **Planification** et **Saisons et heures**. Ces réglages ne conce
 
 ## Ouvrir la photo dans Immich
 
-Le fond d'écran n'est pas cliquable sous Windows. À la place : **clic gauche sur l'icône** près de l'horloge, ou l'icône **« Voir cette photo dans Immich »** déposée sur le bureau (désactivable dans les réglages).
+Le fond d'écran n'est pas cliquable sous Windows. À la place : menu de l'icône près de l'horloge (clic droit) → **Voir la photo dans Immich**, ou l'icône **« Voir cette photo dans Immich »** déposée sur le bureau (désactivable dans les réglages).
 
 ## Couleurs
 
